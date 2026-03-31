@@ -7,11 +7,12 @@ Built on the [Claude Agent SDK](https://docs.anthropic.com/en/docs/agents/agent-
 ## How it works
 
 ```
-analyze                        test
-┌──────────┐   ┌──────────┐   ┌────────────────┐   ┌────────────┐
-│  Explorer │ → │ Scaffold │ → │  You edit the  │ → │  Tester(s) │ → Report
-│  Agent    │   │ Generator│   │  test plan     │   │  in browser│
-└──────────┘   └──────────┘   └────────────────┘   └────────────┘
+        analyze                                test
+╭────────────────────────────╮   ╭────────╮   ╭──────────────────╮
+│ Explorer  →  Scaffold      │   │  You   │   │ Tester(s) run in │
+│ Agent        Generator     │ → │  edit  │ → │ the browser      │ → Report
+│ (browser)    (writes plan) │   │  plan  │   │ (screenshots)    │
+╰────────────────────────────╯   ╰────────╯   ╰──────────────────╯
 ```
 
 1. **`analyze`** — an AI agent opens a real browser, logs in with your credentials, clicks through every page, and generates a Markdown test plan
