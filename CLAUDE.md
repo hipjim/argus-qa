@@ -18,16 +18,16 @@ Requires Python 3.11+, Node.js 18+ (for Playwright MCP via npx), and Claude Code
 ## Running
 
 ```bash
-ui-tester analyze https://example.com -u user -p pass    # explore and generate testplan.md
-ui-tester test testplan.md                                # run tests
-ui-tester test testplan.md --only TC-001,TC-002           # run specific tests
-ui-tester test testplan.md --parallel 3                   # parallel agents
-ui-tester watch testplan.md --interval 15                 # watch mode
+argus-qa analyze https://example.com -u user -p pass    # explore and generate testplan.md
+argus-qa test testplan.md                                # run tests
+argus-qa test testplan.md --only TC-001,TC-002           # run specific tests
+argus-qa test testplan.md --parallel 3                   # parallel agents
+argus-qa watch testplan.md --interval 15                 # watch mode
 ```
 
 ## Architecture
 
-The pipeline has two modes, both orchestrated in `ui_tester/agents/orchestrator.py`:
+The pipeline has two modes, both orchestrated in `argus_qa/agents/orchestrator.py`:
 
 **Analyze mode:** Explorer agent (browser) -> Scaffold generator (reasoning-only) -> writes `testplan.md`
 

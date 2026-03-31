@@ -1,16 +1,16 @@
-"""CLI entry point for ui-tester."""
+"""CLI entry point for argus-qa."""
 
 import argparse
 import asyncio
 import sys
 
-from ui_tester import colors as c
-from ui_tester.agents.orchestrator import run_analyze, run_tests, run_watch
+from argus_qa import colors as c
+from argus_qa.agents.orchestrator import run_analyze, run_tests, run_watch
 
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="ui-tester",
+        prog="argus-qa",
         description="AI-powered UI testing — explore apps and run test plans like a human.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -92,7 +92,7 @@ def main():
 
     try:
         if args.command == "analyze":
-            print(c.header(f"\n  ui-tester analyze — targeting {args.url}"))
+            print(c.header(f"\n  argus-qa analyze — targeting {args.url}"))
             print(f"  {c.DIM}1.{c.RESET} Explore the app with a browser agent")
             print(f"  {c.DIM}2.{c.RESET} Generate a test plan scaffold you can edit\n")
             credentials = None
@@ -101,7 +101,7 @@ def main():
             result = asyncio.run(run_analyze(args.url, args.output, credentials))
             print(c.banner(f"Done! Test plan scaffold: {result}"))
             print(f"\n  Edit it, then run:")
-            print(f"  {c.BOLD}ui-tester test {result}{c.RESET}\n")
+            print(f"  {c.BOLD}argus-qa test {result}{c.RESET}\n")
 
         elif args.command == "test":
             only = [s.strip() for s in args.only.split(",")] if args.only else None
@@ -114,7 +114,7 @@ def main():
                 n_label = f" (skipping {len(skip)})"
             par_label = f", {args.parallel} agents" if args.parallel > 1 else ""
 
-            print(c.header(f"\n  ui-tester test — running {args.plan}{n_label}{par_label}"))
+            print(c.header(f"\n  argus-qa test — running {args.plan}{n_label}{par_label}"))
             print(f"  {c.DIM}1.{c.RESET} Execute test cases in the browser")
             print(f"  {c.DIM}2.{c.RESET} Capture screenshots")
             print(f"  {c.DIM}3.{c.RESET} Generate a quality report\n")
@@ -131,7 +131,7 @@ def main():
             print(c.banner(f"Done! Report: {result}"))
 
         elif args.command == "watch":
-            print(c.header(f"\n  ui-tester watch — monitoring {args.plan}"))
+            print(c.header(f"\n  argus-qa watch — monitoring {args.plan}"))
             print(f"  Polling every {c.BOLD}{args.interval}s{c.RESET} for changes")
             print(f"  Will re-run failed tests when the app changes")
             print(c.dim("  Press Ctrl+C to stop.\n"))

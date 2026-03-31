@@ -1,12 +1,12 @@
-# Contributing to ui-tester
+# Contributing to argus-qa
 
 Thanks for your interest in contributing!
 
 ## Setup
 
 ```bash
-git clone https://github.com/hipjim/ui-tester.git
-cd ui-tester
+git clone https://github.com/hipjim/argus-qa.git
+cd argus-qa
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
 ```
@@ -28,7 +28,7 @@ You'll also need:
 - Keep PRs focused — one feature or fix per PR
 - Follow existing code style
 - Update the README if you change CLI flags or behavior
-- Prompt changes in `ui_tester/prompts/` are high-impact — test thoroughly
+- Prompt changes in `argus_qa/prompts/` are high-impact — test thoroughly
 
 ## Reporting bugs
 

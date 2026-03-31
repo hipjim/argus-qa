@@ -15,13 +15,13 @@ from claude_agent_sdk import (
     query,
 )
 
-from ui_tester.agents.definitions import SWARM_AGENTS
-from ui_tester import colors as c
-from ui_tester.plan_parser import TestPlan, parse_test_plan
-from ui_tester.prompts.explorer import EXPLORER_PROMPT
-from ui_tester.prompts.scaffold import SCAFFOLD_PROMPT
-from ui_tester.prompts.tester import TESTER_PROMPT
-from ui_tester.prompts.reporter import REPORTER_PROMPT
+from argus_qa.agents.definitions import SWARM_AGENTS
+from argus_qa import colors as c
+from argus_qa.plan_parser import TestPlan, parse_test_plan
+from argus_qa.prompts.explorer import EXPLORER_PROMPT
+from argus_qa.prompts.scaffold import SCAFFOLD_PROMPT
+from argus_qa.prompts.tester import TESTER_PROMPT
+from argus_qa.prompts.reporter import REPORTER_PROMPT
 
 import random
 import tempfile
@@ -67,7 +67,7 @@ def _make_playwright_mcp(agent_id: str | None = None) -> dict:
     if agent_id is None:
         return PLAYWRIGHT_MCP
 
-    user_data_dir = Path(tempfile.gettempdir()) / f"ui-tester-{agent_id}"
+    user_data_dir = Path(tempfile.gettempdir()) / f"argus-qa-{agent_id}"
     user_data_dir.mkdir(parents=True, exist_ok=True)
     return {
         "playwright": {
@@ -317,7 +317,7 @@ async def run_tests(
         failures_file = report_dir / f"{timestamp}_failures.txt"
         failures_file.write_text("\n".join(failed_ids) + "\n")
         print(c.warn(f"  Failed tests saved to {failures_file}"))
-        print(f"  Re-run just failures: {c.BOLD}ui-tester test {test_plan_file} --only {','.join(failed_ids)}{c.RESET}")
+        print(f"  Re-run just failures: {c.BOLD}argus-qa test {test_plan_file} --only {','.join(failed_ids)}{c.RESET}")
 
     return str(report_file)
 

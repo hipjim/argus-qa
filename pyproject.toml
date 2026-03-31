@@ -1,5 +1,5 @@
 [project]
-name = "ui-tester"
+name = "argus-qa"
 version = "0.1.0"
 description = "AI-powered UI testing swarm using Claude Agent SDK and Playwright"
 readme = "README.md"
@@ -24,16 +24,16 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/hipjim/ui-tester"
-Repository = "https://github.com/hipjim/ui-tester"
-Issues = "https://github.com/hipjim/ui-tester/issues"
+Homepage = "https://github.com/hipjim/argus-qa"
+Repository = "https://github.com/hipjim/argus-qa"
+Issues = "https://github.com/hipjim/argus-qa/issues"
 
 [build-system]
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["ui_tester*"]
+include = ["argus_qa*"]
 
 [project.scripts]
-ui-tester = "ui_tester.cli:main"
+argus-qa = "argus_qa.cli:main"

@@ -1,4 +1,4 @@
-# ui-tester
+# argus-qa
 
 AI agents that test your web app like real humans. They explore, learn, click around, and write you a report.
 
@@ -28,8 +28,8 @@ No test code to write. No selectors to maintain. Just plain English.
 # - Node.js (for Playwright MCP)
 # - Claude Code CLI (authenticated with your Claude subscription)
 
-git clone https://github.com/hipjim/ui-tester.git
-cd ui-tester
+git clone https://github.com/hipjim/argus-qa.git
+cd argus-qa
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
 ```
@@ -38,13 +38,13 @@ pip install -e .
 
 ```bash
 # Step 1: Explore your app and generate a test plan
-ui-tester analyze https://myapp.com -u admin -p admin
+argus-qa analyze https://myapp.com -u admin -p admin
 
 # Step 2: Review and edit the generated test plan
 $EDITOR testplan.md
 
 # Step 3: Run the tests
-ui-tester test testplan.md
+argus-qa test testplan.md
 ```
 
 The report lands in `reports/`.
@@ -54,7 +54,7 @@ The report lands in `reports/`.
 ### `analyze` — Explore and generate a test plan
 
 ```bash
-ui-tester analyze <url> [options]
+argus-qa analyze <url> [options]
 ```
 
 An AI agent opens a browser, logs in, navigates every page, maps forms and flows, and writes a Markdown test plan you can edit.
@@ -67,16 +67,16 @@ An AI agent opens a browser, logs in, navigates every page, maps forms and flows
 
 ```bash
 # Public site (no login)
-ui-tester analyze https://example.com
+argus-qa analyze https://example.com
 
 # Authenticated app
-ui-tester analyze https://staging.myapp.com -u admin -p secret -o myapp-tests.md
+argus-qa analyze https://staging.myapp.com -u admin -p secret -o myapp-tests.md
 ```
 
 ### `test` — Execute a test plan
 
 ```bash
-ui-tester test <plan.md> [options]
+argus-qa test <plan.md> [options]
 ```
 
 Agents open a browser and follow each test case step by step — clicking, typing, navigating, and comparing actual results to expected outcomes.
@@ -92,25 +92,25 @@ Agents open a browser and follow each test case step by step — clicking, typin
 
 ```bash
 # Run everything
-ui-tester test testplan.md
+argus-qa test testplan.md
 
 # Run just login tests
-ui-tester test testplan.md --only TC-001,TC-002,TC-003
+argus-qa test testplan.md --only TC-001,TC-002,TC-003
 
 # Skip slow tests
-ui-tester test testplan.md --skip TC-042,TC-043
+argus-qa test testplan.md --skip TC-042,TC-043
 
 # 3 parallel agents (each gets its own isolated headless browser)
-ui-tester test testplan.md --parallel 3
+argus-qa test testplan.md --parallel 3
 
 # Re-run only failures from last run
-ui-tester test testplan.md --only TC-003,TC-018,TC-034
+argus-qa test testplan.md --only TC-003,TC-018,TC-034
 ```
 
 ### `watch` — Re-run failed tests on app changes
 
 ```bash
-ui-tester watch <plan.md> [options]
+argus-qa watch <plan.md> [options]
 ```
 
 Polls your app and re-runs failed tests automatically when it detects a change. Once all tests pass, it watches for regressions.
@@ -124,10 +124,10 @@ Polls your app and re-runs failed tests automatically when it detects a change. 
 
 ```bash
 # Watch and re-test every 30 seconds
-ui-tester watch testplan.md
+argus-qa watch testplan.md
 
 # Faster polling with parallel agents
-ui-tester watch testplan.md --interval 15 --parallel 2
+argus-qa watch testplan.md --interval 15 --parallel 2
 ```
 
 ## The test plan format
@@ -208,7 +208,7 @@ When you use `--parallel N`, the test plan is split into N chunks. Each chunk ru
 
 ```bash
 # 45 tests ÷ 3 agents = ~15 tests each
-ui-tester test testplan.md --parallel 3
+argus-qa test testplan.md --parallel 3
 ```
 
 ```
@@ -224,7 +224,7 @@ Sequential mode runs with a headed browser so you can watch. Parallel mode runs 
 ## Architecture
 
 ```
-ui_tester/
+argus_qa/
 ├── cli.py                  # Entry point — analyze, test, watch subcommands
 ├── plan_parser.py          # Parses Markdown test plans into structured objects
 ├── agents/
