@@ -20,6 +20,9 @@ reports/
 testplan.md
 screenshots/
 
+# Claude Code local settings
+.claude/
+
 # IDE
 .idea/
 .vscode/
