@@ -180,11 +180,22 @@ See [`examples/testplan_example.md`](examples/testplan_example.md) for a full ex
 
 ### Reports
 
-Each test run produces:
-- **`<timestamp>_report.md`** — full quality report with executive summary, bug list, detailed results, and a quality score
-- **`<timestamp>_results.json`** — raw structured test results
-- **`<timestamp>_failures.txt`** — failed test IDs, ready for `--only` re-runs
-- **`screenshots/`** — screenshots captured during test execution
+Each test run creates its own directory under `reports/`:
+
+```
+reports/
+├── staging.myapp.com/
+│   ├── 20260331_143612/
+│   │   ├── report.md        # quality report with bugs, scores, and recommendations
+│   │   ├── results.json     # raw structured test results
+│   │   ├── failures.txt     # failed test IDs, ready for --only re-runs
+│   │   └── screenshots/     # screenshots captured during execution
+│   └── 20260331_160045/
+│       └── ...
+└── example.com/
+    └── 20260331_150000/
+        └── ...
+```
 
 ### Sample report output
 

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 from claude_agent_sdk import (
     ClaudeAgentOptions,
@@ -235,11 +237,15 @@ async def run_tests(
     if not plan.cases:
         raise ValueError("No test cases to run after applying --only/--skip filters.")
 
-    report_dir = Path(output_dir)
-    report_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    parsed = urlparse(url)
+    host = parsed.hostname or "unknown"
+    site = f"{host}-{parsed.port}" if parsed.port else host
+    site = re.sub(r"[^\w\-.]", "_", site)
+    run_dir = Path(output_dir) / site / timestamp
+    run_dir.mkdir(parents=True, exist_ok=True)
 
-    ss_dir = Path(screenshot_dir or report_dir / "screenshots" / timestamp)
+    ss_dir = Path(screenshot_dir or run_dir / "screenshots")
     ss_dir.mkdir(parents=True, exist_ok=True)
 
     total = len(plan.cases)
@@ -281,7 +287,7 @@ async def run_tests(
 
     # Merge results
     merged_results = _merge_results(all_results)
-    results_file = report_dir / f"{timestamp}_results.json"
+    results_file = run_dir / "results.json"
     results_file.write_text(json.dumps(merged_results, indent=2))
     print(c.success("\n  Tests complete.\n"))
 
@@ -307,14 +313,14 @@ async def run_tests(
         label="reporter",
     )
 
-    report_file = report_dir / f"{timestamp}_report.md"
+    report_file = run_dir / "report.md"
     report_file.write_text(report)
     print(c.success(f"\n  Report saved to {report_file}\n"))
 
     # Save failed test IDs for watch mode / re-run
     failed_ids = _extract_failed_ids(merged_results)
     if failed_ids:
-        failures_file = report_dir / f"{timestamp}_failures.txt"
+        failures_file = run_dir / "failures.txt"
         failures_file.write_text("\n".join(failed_ids) + "\n")
         print(c.warn(f"  Failed tests saved to {failures_file}"))
         print(f"  Re-run just failures: {c.BOLD}argus-qa test {test_plan_file} --only {','.join(failed_ids)}{c.RESET}")
@@ -380,7 +386,6 @@ def _merge_results(results: list[str]) -> dict:
 def _extract_json(text: str) -> str:
     """Extract JSON from text that might have markdown code fences."""
     # Try to find ```json ... ``` blocks
-    import re
     match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
     if match:
         return match.group(1)
@@ -495,7 +500,7 @@ async def _fetch_hash(url: str) -> str:
 
 def _load_latest_failures(report_dir: Path) -> list[str]:
     """Find the most recent failures file and load the IDs."""
-    failure_files = sorted(report_dir.glob("*_failures.txt"), reverse=True)
+    failure_files = sorted(report_dir.glob("**/failures.txt"), reverse=True)
     if not failure_files:
         return []
     return [
