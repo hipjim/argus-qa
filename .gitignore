@@ -19,6 +19,9 @@ Thumbs.db
 reports/
 testplan.md
 screenshots/
+*.png
+*.jpg
+*.jpeg
 
 # Claude Code local settings
 .claude/
