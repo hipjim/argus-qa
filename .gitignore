@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.venv/
+
+# Node (Playwright MCP)
+node_modules/
+.playwright-mcp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated artifacts
+reports/
+testplan.md
+screenshots/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
