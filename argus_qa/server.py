@@ -119,6 +119,7 @@ class RunRequest(BaseModel):
     skip: list[str] | None = Field(None, description="Skip these test case IDs.")
     parallel: int = Field(1, ge=1, le=8, description="Parallel browser agents for this run.")
     max_cost_usd: float | None = CostLimit
+    ai_report: bool = Field(False, description="Have an agent write the report (costs extra).")
     callback_url: HttpUrl | None = Field(None, description="POSTed the run record when the run finishes.")
 
     @model_validator(mode="after")
@@ -143,6 +144,7 @@ class SuiteRunRequest(BaseModel):
     parallel: int = Field(1, ge=1, le=8)
     url: HttpUrl | None = None
     max_cost_usd: float | None = CostLimit
+    ai_report: bool = False
     callback_url: HttpUrl | None = None
 
 
@@ -200,6 +202,7 @@ class Run(BaseModel):
     accepted: list[str] = Field([], description="Proposed test IDs already saved to a suite.")
     cost_usd: float | None = None
     max_cost_usd: float | None = None
+    models: list[str] = Field([], description="Models the agents used, e.g. claude-sonnet-5.")
     error: str | None = None
     callback_url: str | None = None
     parallel: int = 1
@@ -429,11 +432,12 @@ class RunManager:
         async def job() -> None:
             result = await execute_plan(
                 plan, run.url, self.run_dir(run.id), parallel=req.parallel, headless=True,
-                isolated=True, project=project, max_cost_usd=max_cost,
+                isolated=True, project=project, max_cost_usd=max_cost, ai_report=req.ai_report,
             )
             run.summary = result.results["summary"]
             run.failed_ids = result.failed_ids
             run.cost_usd = round(result.cost_usd, 4)
+            run.models = result.models
             if result.environment_error:
                 run.status = "error"
                 run.error = f"Browser/environment problem: {result.environment_error}"
@@ -483,6 +487,7 @@ class RunManager:
             run.summary = result.summary
             run.test_ids = [tc.id for tc in result.proposed]
             run.cost_usd = round(result.cost_usd, 4)
+            run.models = result.models
             if result.environment_error:
                 run.status = "error"
                 run.error = f"Browser/environment problem: {result.environment_error}"
@@ -705,7 +710,8 @@ def create_app(data_dir: str | Path = "argus-data", max_concurrent: int = 2) -> 
         body = body or SuiteRunRequest()
         return manager.submit(
             RunRequest(plan=suite.plan, project=slug, only=body.only, parallel=body.parallel,
-                       url=body.url, max_cost_usd=body.max_cost_usd, callback_url=body.callback_url),
+                       url=body.url, max_cost_usd=body.max_cost_usd, ai_report=body.ai_report,
+                       callback_url=body.callback_url),
             suite=suite.slug, title=suite.name,
         )
 

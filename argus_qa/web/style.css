@@ -335,6 +335,7 @@ main:focus { outline: none; }
   color: var(--ink-2);
 }
 .run-meta .mono { color: var(--ink-2); }
+.run-meta .models { font: 12px var(--mono); padding: 1px 7px; border: 1px solid var(--rule-strong); border-radius: 999px; }
 
 .scoreboard {
   display: grid;

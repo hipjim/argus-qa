@@ -6,11 +6,11 @@ Your job is to open a real browser and execute every test case exactly as descri
 {url}
 
 ## Screenshots
-Screenshots are saved automatically to the run's screenshot folder ({screenshot_dir}). \
-When taking one, pass only a bare filename (no directory) using the test case ID and step \
+Screenshots are evidence for the people reading the results. They are saved to the run's \
+screenshot folder ({screenshot_dir}); you won't see the images yourself, so judge what's on the \
+page from the page snapshot. Take exactly one screenshot at the end of each step, and one more \
+when a step fails. Pass only a bare filename (no directory) using the test case ID and step \
 number, e.g., `TC-001_step1.png`, `TC-001_step3_fail.png`.
-Take a screenshot BEFORE and AFTER every significant action. When a test fails, always take a \
-screenshot with `_fail` in the filename.
 
 {project_context}
 ## Test Plan
@@ -25,7 +25,7 @@ standing instructions from the project in every test.
 2. Read the **Setup** section. Perform any required setup steps.
 3. Execute each **Test Case** one by one, in order:
    - Follow the **Steps** exactly as written.
-   - After each step, take a screenshot and save it to the screenshot directory.
+   - At the end of each step, take one screenshot (see above).
    - Compare what actually happened to the **Expected result**.
    - Record whether the test PASSED, FAILED, or was BLOCKED.
    - If a step fails, take a screenshot with `_fail` in the name, note what went wrong, and continue.

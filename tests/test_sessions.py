@@ -330,3 +330,22 @@ async def test_bulk_delete(client, fakes):
         assert (await client.post("/runs/delete", json={"ids": []})).status_code == 422
         fakes["gate"].set()
         await _finished(client, active)
+
+
+async def test_models_and_ai_report_flow_through(client, monkeypatch):
+    seen = []
+
+    async def execute_plan(plan, url, run_dir, **kwargs):
+        seen.append(kwargs)
+        merged = merge_results([json.dumps({"results": [{"id": tc.id, "status": "passed"} for tc in plan.cases]})], plan)
+        return RunResult(run_dir, run_dir / "report.md", merged, [], cost_usd=0.1, models=["claude-sonnet-5"])
+
+    monkeypatch.setattr(server, "execute_plan", execute_plan)
+    async with client:
+        await client.post("/projects", json=PROJECT)
+        plain = (await client.post("/runs", json={"project": "looma", "scenario": "x"})).json()
+        fancy = (await client.post("/runs", json={"project": "looma", "scenario": "x", "ai_report": True})).json()
+        plain = await _finished(client, plain["id"])
+        await _finished(client, fancy["id"])
+    assert plain["models"] == ["claude-sonnet-5"]
+    assert [k["ai_report"] for k in seen] == [False, True]

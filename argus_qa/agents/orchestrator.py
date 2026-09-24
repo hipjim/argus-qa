@@ -41,6 +41,7 @@ from argus_qa.results import (
     exploration_report,
     extract_json,
     merge_results,
+    test_report,
     to_junit,
 )
 from argus_qa.results import failed_ids as _failed_ids
@@ -66,6 +67,20 @@ AGENT_NAMES = [
 
 # Pinned so upstream releases can't silently change browser behaviour between runs
 PLAYWRIGHT_MCP_PACKAGE = "@playwright/mcp@0.0.82"
+
+# Model per agent role. Following written steps and writing up results don't need the
+# largest model; deciding what to explore and what counts as a bug does. Override with
+# ARGUS_MODEL (every role) or ARGUS_MODEL_TESTER / _EXPLORER / _WRITER.
+DEFAULT_MODELS = {"tester": "claude-sonnet-5", "writer": "claude-sonnet-5", "explorer": "claude-opus-5-5"}
+
+
+def model_for(role: str) -> str:
+    return (
+        os.environ.get(f"ARGUS_MODEL_{role.upper()}")
+        or os.environ.get("ARGUS_MODEL")
+        or DEFAULT_MODELS[role]
+    )
+
 
 # Turn limits per agent, so a confused agent can't loop forever
 TESTER_MAX_TURNS = 300
@@ -96,12 +111,14 @@ def _make_playwright_mcp(
     headless: bool = False,
     isolated: bool = False,
     output_dir: Path | None = None,
+    images: bool = True,
 ) -> dict:
     """Create a Playwright MCP config.
 
     Isolated instances keep their browser profile in memory, so multiple
     browsers can run side by side without conflicting. output_dir is where
-    the browser saves screenshots. Extra flags (e.g. "--browser chromium
+    the browser saves screenshots. Without images, screenshots are still saved
+    to disk but not sent back to the model, which saves a lot of tokens. Extra flags (e.g. "--browser chromium
     --no-sandbox" in containers) can be passed via ARGUS_PLAYWRIGHT_ARGS.
     """
     extra = shlex.split(os.environ.get("ARGUS_PLAYWRIGHT_ARGS", ""))
@@ -116,6 +133,8 @@ def _make_playwright_mcp(
         args.append("--isolated")
     if output_dir is not None:
         args.extend(["--output-dir", str(output_dir.resolve())])
+    if not images:
+        args.extend(["--image-responses", "omit"])
     return {"playwright": {"command": "npx", "args": args}}
 
 
@@ -125,6 +144,8 @@ def _browser_options(
     output_dir: Path | None = None,
     max_budget_usd: float | None = None,
     max_turns: int | None = TESTER_MAX_TURNS,
+    model: str | None = None,
+    images: bool = True,
 ) -> ClaudeAgentOptions:
     """Options for agents that need browser access.
 
@@ -133,7 +154,10 @@ def _browser_options(
     working directory, while --output-dir only covers auto-named files.
     """
     return ClaudeAgentOptions(
-        mcp_servers=_make_playwright_mcp(headless=headless, isolated=isolated, output_dir=output_dir),
+        mcp_servers=_make_playwright_mcp(
+            headless=headless, isolated=isolated, output_dir=output_dir, images=images
+        ),
+        model=model,
         tools=[],
         allowed_tools=["mcp__playwright__*"],
         cwd=str(output_dir.resolve()) if output_dir is not None else None,
@@ -142,10 +166,11 @@ def _browser_options(
     )
 
 
-def _reasoning_options(max_budget_usd: float | None = None) -> ClaudeAgentOptions:
+def _reasoning_options(max_budget_usd: float | None = None, model: str | None = None) -> ClaudeAgentOptions:
     """Options for agents that only need to think and write."""
     return ClaudeAgentOptions(
-        tools=[], allowed_tools=[], max_budget_usd=max_budget_usd, max_turns=REPORTER_MAX_TURNS
+        tools=[], allowed_tools=[], max_budget_usd=max_budget_usd, max_turns=REPORTER_MAX_TURNS,
+        model=model,
     )
 
 
@@ -159,6 +184,12 @@ class AgentRun:
     ok: bool
     cost_usd: float = 0.0
     turns: int = 0
+    models: list[str] = field(default_factory=list)
+
+
+def _models(runs: list[AgentRun]) -> list[str]:
+    """Distinct models used across agents, e.g. ['claude-sonnet-5']."""
+    return sorted({m for r in runs for m in r.models})
 
 
 async def _run_agent(
@@ -191,6 +222,7 @@ async def _run_agent(
         elif isinstance(message, ResultMessage):
             run.cost_usd = message.total_cost_usd or 0.0
             run.turns = message.num_turns
+            run.models = sorted(m.split("[")[0] for m in (message.model_usage or {}))
             if message.subtype == "success" and not message.is_error:
                 run.ok = True
                 run.text = redact(message.result or "")
@@ -279,6 +311,7 @@ class SessionResult:
     cost_usd: float = 0.0
     environment_error: str | None = None
     raw_plan: str = ""
+    models: list[str] = field(default_factory=list)
 
 
 def _login_text(project: Project | None, credentials: dict[str, str] | None) -> str:
@@ -339,6 +372,7 @@ async def discover_app(
         options=_browser_options(
             headless=headless, isolated=isolated, output_dir=ss_dir,
             max_budget_usd=_share(max_cost_usd, 0.8), max_turns=EXPLORER_MAX_TURNS,
+            model=model_for("explorer"), images=False,
         ),
         label=explorer_name,
         redact=redact,
@@ -350,7 +384,8 @@ async def discover_app(
     (run_dir / "exploration.json").write_text(json.dumps(data or {"raw": exploration.text}, indent=2))
     if data and data.get("environment_error"):
         emit("error", f"The browser couldn't explore the app: {data['environment_error']}")
-        return SessionResult(run_dir, {}, [], exploration.cost_usd, str(data["environment_error"]))
+        return SessionResult(run_dir, {}, [], exploration.cost_usd, str(data["environment_error"]),
+                             models=exploration.models)
     print(c.success("\n  Exploration complete.\n"))
 
     guidance = ""
@@ -378,7 +413,7 @@ async def discover_app(
             exploration_report=exploration.text,
             project_guidance=guidance,
         ),
-        options=_reasoning_options(max_budget_usd=_share(max_cost_usd, 0.2)),
+        options=_reasoning_options(max_budget_usd=_share(max_cost_usd, 0.2), model=model_for("writer")),
         label="scaffold",
         redact=redact,
     )
@@ -399,7 +434,8 @@ async def discover_app(
         "flows": len((data or {}).get("user_flows") or []),
     }
     emit("phase", f"Proposed {len(cases)} test cases")
-    return SessionResult(run_dir, summary, cases, cost, raw_plan=scaffold.text)
+    return SessionResult(run_dir, summary, cases, cost, raw_plan=scaffold.text,
+                         models=_models([exploration, scaffold]))
 
 
 async def explore_app(
@@ -429,6 +465,7 @@ async def explore_app(
         options=_browser_options(
             headless=headless, isolated=isolated, output_dir=ss_dir,
             max_budget_usd=max_cost_usd, max_turns=EXPLORER_MAX_TURNS,
+            model=model_for("explorer"), images=True,  # sees the page, to spot visual bugs
         ),
         label=name,
         redact=redact,
@@ -439,7 +476,7 @@ async def explore_app(
         raise RuntimeError(f"The exploratory session produced no report: {run.text[:300]}")
     if data.get("environment_error"):
         emit("error", f"The browser couldn't explore the app: {data['environment_error']}")
-        return SessionResult(run_dir, {}, [], run.cost_usd, str(data["environment_error"]))
+        return SessionResult(run_dir, {}, [], run.cost_usd, str(data["environment_error"]), models=run.models)
 
     bugs = [b for b in data.get("bugs") or [] if isinstance(b, dict)]
     cases = bugs_to_cases(bugs)
@@ -449,7 +486,7 @@ async def explore_app(
         (run_dir / "proposed.md").write_text(compose_plan("Regression tests from exploration", url, cases))
     summary = {"bugs": len(bugs), "proposed": len(cases)}
     emit("phase", f"Found {len(bugs)} bug{'s' if len(bugs) != 1 else ''}")
-    return SessionResult(run_dir, summary, cases, run.cost_usd)
+    return SessionResult(run_dir, summary, cases, run.cost_usd, models=run.models)
 
 
 # ── Test mode ───────────────────────────────────────────────────────
@@ -462,6 +499,7 @@ class RunResult:
     results: dict
     failed_ids: list[str] = field(default_factory=list)
     cost_usd: float = 0.0
+    models: list[str] = field(default_factory=list)
 
     @property
     def environment_error(self) -> str | None:
@@ -490,6 +528,7 @@ async def run_tests(
     junit_file: str | None = None,
     project: Project | None = None,
     max_cost_usd: float | None = None,
+    ai_report: bool = False,
 ) -> RunResult:
     """Execute a test plan from a Markdown file.
 
@@ -505,6 +544,7 @@ async def run_tests(
         junit_file: Extra path to write JUnit XML to, in addition to the run dir.
         project: Project supplying the URL, test accounts, data, and instructions.
         max_cost_usd: Stop agents once the run's estimated cost reaches this.
+        ai_report: Have an agent write the report, instead of building it from the results.
     """
     plan_path = Path(test_plan_file)
     if not plan_path.exists():
@@ -541,6 +581,7 @@ async def run_tests(
         screenshot_dir=Path(screenshot_dir) if screenshot_dir else None,
         project=project,
         max_cost_usd=max_cost_usd,
+        ai_report=ai_report,
     )
     if result.environment_error:
         raise RuntimeError(
@@ -569,14 +610,17 @@ async def execute_plan(
     isolated: bool = False,
     project: Project | None = None,
     max_cost_usd: float | None = None,
+    ai_report: bool = False,
 ) -> RunResult:
     """Run the given test cases, write results/report/JUnit to run_dir, and return the outcome.
 
     Set isolated when other runs may be using a browser at the same time. The
     project's secrets are given to tester agents but redacted from everything
-    printed or saved, and never shown to the reporter. max_cost_usd is split between the
-    tester agents (90%) and the reporter (10%).
+    printed or saved, and never shown to the reporter. The report is built from the
+    results unless ai_report is set, in which case an agent writes it and gets 10% of
+    max_cost_usd; the tester agents share the rest.
     """
+    tester_share = 0.9 if ai_report else 1.0
     substitute(plan.to_markdown(), project)  # fail fast on unknown {{placeholders}}
     redact = Redactor(project.secret_values() if project else [])
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -605,7 +649,7 @@ async def execute_plan(
         emit("phase", f"{tester_name} is running {total} test{'s' if total != 1 else ''}")
         runs = [await _run_test_chunk(
             url, plan, ss_dir, label=tester_name, headless=headless, isolated=isolated,
-            project=project, redact=redact, max_budget_usd=_share(max_cost_usd, 0.9),
+            project=project, redact=redact, max_budget_usd=_share(max_cost_usd, tester_share),
         )]
     else:
         chunks = plan.split_chunks(min(parallel, total))
@@ -621,7 +665,8 @@ async def execute_plan(
             tasks.append(
                 _run_test_chunk(
                     url, chunk, ss_dir, label=name, headless=True, isolated=True,
-                    project=project, redact=redact, max_budget_usd=_share(max_cost_usd, 0.9 / len(chunks)),
+                    project=project, redact=redact,
+                    max_budget_usd=_share(max_cost_usd, tester_share / len(chunks)),
                 )
             )
         print()
@@ -643,7 +688,7 @@ async def execute_plan(
         print(c.error(f"  Browser/environment problem: {problem}"))
         emit("error", f"The browser couldn't run the tests: {problem}")
         return RunResult(run_dir=run_dir, report_file=run_dir / "report.md", results=merged_results,
-                         failed_ids=[], cost_usd=runs_cost)
+                         failed_ids=[], cost_usd=runs_cost, models=_models(runs))
 
     # Print quick summary
     summary = merged_results["summary"]
@@ -654,23 +699,27 @@ async def execute_plan(
         summary["skipped"],
     ))
 
-    # ── Phase 2: Generate report ────────────────────────────────
-    print(c.phase(2, 2, "Generating report..."))
-    emit("phase", "Writing the report")
-    report = await _run_agent(
-        prompt=REPORTER_PROMPT.format(
-            exploration_report="(not available — ran from existing test plan)",
-            test_plan=plan.to_markdown(),
-            test_results=json.dumps(merged_results, indent=2),
-            screenshot_dir=str(ss_dir),
-        ),
-        options=_reasoning_options(max_budget_usd=_share(max_cost_usd, 0.1)),
-        label="reporter",
-        redact=redact,
-    )
-
+    # ── Phase 2: Report ─────────────────────────────────────────
+    agents = list(runs)
     report_file = run_dir / "report.md"
-    report_file.write_text(report.text)
+    if ai_report:
+        print(c.phase(2, 2, "Generating report..."))
+        emit("phase", "Writing the report")
+        report = await _run_agent(
+            prompt=REPORTER_PROMPT.format(
+                exploration_report="(not available — ran from existing test plan)",
+                test_plan=plan.to_markdown(),
+                test_results=json.dumps(merged_results, indent=2),
+                screenshot_dir=str(ss_dir),
+            ),
+            options=_reasoning_options(max_budget_usd=_share(max_cost_usd, 0.1), model=model_for("writer")),
+            label="reporter",
+            redact=redact,
+        )
+        agents.append(report)
+        report_file.write_text(report.text)
+    else:
+        report_file.write_text(test_report(merged_results, plan, url))
     print(c.success(f"\n  Report saved to {report_file}\n"))
 
     # Save failed test IDs for re-runs
@@ -680,8 +729,8 @@ async def execute_plan(
         failures_file.write_text("\n".join(failed) + "\n")
         print(c.warn(f"  Failed tests saved to {failures_file}"))
 
-    cost = runs_cost + report.cost_usd
-    print(c.dim(f"  Cost: ${cost:.2f}"))
+    cost = sum(a.cost_usd for a in agents)
+    print(c.dim(f"  Cost: ${cost:.2f}   Models: {', '.join(_models(agents)) or 'unknown'}"))
 
     return RunResult(
         run_dir=run_dir,
@@ -689,6 +738,7 @@ async def execute_plan(
         results=merged_results,
         failed_ids=failed,
         cost_usd=cost,
+        models=_models(agents),
     )
 
 
@@ -729,7 +779,9 @@ async def _run_test_chunk(
         project_context=project.prompt_section() if project else "",
     )
     options = _browser_options(
-        headless=headless, isolated=isolated, output_dir=screenshot_dir, max_budget_usd=max_budget_usd
+        headless=headless, isolated=isolated, output_dir=screenshot_dir, max_budget_usd=max_budget_usd,
+        model=model_for("tester"),
+        images=False,  # it reads the page as text; screenshots are evidence for people
     )
     return await _run_agent(prompt, options, label=label, redact=redact)
 

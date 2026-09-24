@@ -148,7 +148,7 @@ async def test_execute_plan_uses_project_and_never_saves_secrets(project, tmp_pa
     plan = parse_test_plan(
         "### TC-001: Admin login\n\n1. Log in as admin with {{admin.password}}\n2. Search {{search_term}}\n"
     )
-    result = await orchestrator.execute_plan(plan, project.url, tmp_path / "run", project=project)
+    result = await orchestrator.execute_plan(plan, project.url, tmp_path / "run", project=project, ai_report=True)
 
     tester_prompt = next(p for label, p in prompts if label != "reporter")
     assert "Log in as admin with admin-secret-9" in tester_prompt
@@ -267,3 +267,82 @@ def test_budget_split_for_test_runs():
     assert opts.max_budget_usd == pytest.approx(1.5)
     assert orchestrator._browser_options().max_budget_usd is None
     assert orchestrator._reasoning_options(max_budget_usd=0.5).max_turns == orchestrator.REPORTER_MAX_TURNS
+
+
+
+# ── cost controls: models, screenshots, report ──────────────
+
+
+async def test_default_report_needs_no_model_call(tmp_path, monkeypatch):
+    calls = []
+
+    async def fake_agent(prompt, options, label="", redact=None):
+        calls.append((label, options))
+        text = json.dumps({"results": [
+            {"id": "TC-001", "name": "Login", "status": "passed"},
+            {"id": "TC-002", "name": "Save", "status": "failed",
+             "steps": [{"step": "Click Save", "expected": "Saved", "actual": "Error 500", "status": "failed",
+                        "screenshot": "TC-002_step1_fail.png"}]},
+        ]})
+        return orchestrator.AgentRun(text=text, ok=True, cost_usd=0.2, models=["claude-sonnet-5"])
+
+    monkeypatch.setattr(orchestrator, "_run_agent", fake_agent)
+    plan = parse_test_plan("# Test Plan: Smoke\n\n### TC-001: Login\n\nx\n\n### TC-002: Save\n\ny\n")
+    result = await orchestrator.execute_plan(plan, "https://app.test", tmp_path / "run", max_cost_usd=2.0)
+
+    assert [label for label, _ in calls if label == "reporter"] == []
+    assert calls[0][1].max_budget_usd == pytest.approx(2.0)  # no reporter share held back
+    report = (tmp_path / "run" / "report.md").read_text()
+    assert report.startswith("# Test report: Smoke")
+    assert report.index("TC-002") < report.index("TC-001")  # failures first
+    assert "Error 500" in report and "screenshots/TC-002_step1_fail.png" in report
+    assert "--only TC-002" in report
+    assert result.models == ["claude-sonnet-5"]
+    assert result.cost_usd == pytest.approx(0.2)
+
+
+def test_tester_uses_sonnet_and_gets_no_images(monkeypatch):
+    for var in ("ARGUS_MODEL", "ARGUS_MODEL_TESTER", "ARGUS_MODEL_EXPLORER", "ARGUS_MODEL_WRITER"):
+        monkeypatch.delenv(var, raising=False)
+    assert orchestrator.model_for("tester") == "claude-sonnet-5"
+    assert orchestrator.model_for("writer") == "claude-sonnet-5"
+    assert orchestrator.model_for("explorer") == "claude-opus-5-5"
+
+    no_images = orchestrator._browser_options(images=False, model="claude-sonnet-5")
+    args = no_images.mcp_servers["playwright"]["args"]
+    assert args[args.index("--image-responses") + 1] == "omit"
+    assert no_images.model == "claude-sonnet-5"
+    assert "--image-responses" not in orchestrator._browser_options().mcp_servers["playwright"]["args"]
+
+
+def test_model_overrides(monkeypatch):
+    monkeypatch.setenv("ARGUS_MODEL", "claude-opus-5-5")
+    monkeypatch.setenv("ARGUS_MODEL_WRITER", "claude-haiku-4-5-20251001")
+    assert orchestrator.model_for("tester") == "claude-opus-5-5"
+    assert orchestrator.model_for("writer") == "claude-haiku-4-5-20251001"
+
+
+async def test_session_agents_get_role_models(project, tmp_path, monkeypatch):
+    for var in ("ARGUS_MODEL", "ARGUS_MODEL_TESTER", "ARGUS_MODEL_EXPLORER", "ARGUS_MODEL_WRITER"):
+        monkeypatch.delenv(var, raising=False)
+    seen = {}
+
+    async def fake_agent(prompt, options, label="", redact=None):
+        seen[label] = options
+        if label == "scaffold":
+            return orchestrator.AgentRun(text=SCAFFOLD, ok=True, models=["claude-sonnet-5"])
+        return orchestrator.AgentRun(text=json.dumps({**EXPLORATION, "bugs": []}), ok=True, models=["claude-opus-5-5"])
+
+    monkeypatch.setattr(orchestrator, "_run_agent", fake_agent)
+    result = await orchestrator.discover_app(project.url, tmp_path / "d", project=project)
+    explorer = next(o for label, o in seen.items() if label != "scaffold")
+    assert explorer.model == "claude-opus-5-5"
+    assert "omit" in explorer.mcp_servers["playwright"]["args"]      # discovery maps pages as text
+    assert seen["scaffold"].model == "claude-sonnet-5"
+    assert result.models == ["claude-opus-5-5", "claude-sonnet-5"]
+
+    seen.clear()
+    await orchestrator.explore_app(project.url, tmp_path / "e", charter="x", project=project)
+    hunter = next(iter(seen.values()))
+    assert hunter.model == "claude-opus-5-5"
+    assert "--image-responses" not in hunter.mcp_servers["playwright"]["args"]  # sees pages to spot visual bugs

@@ -98,6 +98,7 @@ Agents open a browser and follow each test case step by step — clicking, typin
 | `--screenshots` | Custom screenshot directory |
 | `--headless` | Run the browser without a window (CI/servers) |
 | `--junit PATH` | Also write JUnit XML to PATH (always written to the run dir) |
+| `--ai-report` | Have an agent write the report (costs extra). By default it's built from the results |
 | `-o, --output` | Report directory (default: `reports/`) |
 
 Exit codes: `0` all tests passed, `1` one or more tests failed or were blocked, `2` argus-qa itself errored. This makes `argus-qa test` usable as a CI gate:
@@ -268,6 +269,23 @@ curl -X POST localhost:8080/runs -H 'content-type: application/json' -d '{
 - The URL is taken from `--url`/`url` in the request first, then the project, then the plan's `> URL:` line.
 - Passwords and `secrets` are given to the tester agent only. They are masked in API responses and replaced with `[redacted]` in results, reports, JUnit output, and logs; the report-writing agent never sees them.
 - On the server, `${VAR}` references resolve against the server's environment, and project files are stored readable only by the server's user.
+
+## Models and cost
+
+Each agent role uses a model suited to the job, set explicitly so a run behaves the same on every machine:
+
+| Role | Default | Override |
+|------|---------|----------|
+| Tester (follows written steps) | `claude-sonnet-5` | `ARGUS_MODEL_TESTER` |
+| Explorer (Discover and Explore sessions) | `claude-opus-5-5` | `ARGUS_MODEL_EXPLORER` |
+| Writer (test plans from Discover; optional AI report) | `claude-sonnet-5` | `ARGUS_MODEL_WRITER` |
+
+`ARGUS_MODEL` overrides every role at once. Each run records the models it used, shown on the run page.
+
+Other things that keep runs cheap:
+- Testers read pages as text. Screenshots are saved as evidence but not sent to the model (Playwright MCP `--image-responses omit`). The bug hunter still sees them, so it can spot visual problems.
+- One screenshot per step, plus one when a step fails.
+- Reports are built from the results unless you ask for an AI-written one (`--ai-report`, or `ai_report` in the API).
 
 ## Discover, explore, and saved suites
 

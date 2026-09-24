@@ -266,3 +266,82 @@ def exploration_report(data: dict, url: str) -> str:
 
 def _cell(value) -> str:
     return str(value or "").replace("|", "\\|").replace("\n", " ")
+
+
+# ── Test run report ──────────────────────────────────────────────────
+
+_STATUS_LABEL = {
+    "passed": "✅ Passed", "failed": "❌ Failed", "blocked": "⛔ Blocked", "skipped": "⏭️ Skipped",
+}
+
+
+def test_report(results: dict, plan: TestPlan, url: str) -> str:
+    """Markdown report built from the results, with no model call. Failures come first."""
+    headings = [line[2:] for line in plan.preamble.splitlines() if line.startswith("# ")]
+    title = (headings[0].removeprefix("Test Plan:").strip() if headings else "") or (
+        plan.cases[0].name if len(plan.cases) == 1 else "Test run"
+    )
+    summary = results.get("summary", {})
+    tests = results.get("results", [])
+    problems = [r for r in tests if r.get("status") in FAILING_STATUSES]
+    others = [r for r in tests if r.get("status") not in FAILING_STATUSES]
+
+    out = [f"# Test report: {title}", "", f"**Target:** {url}", ""]
+    out += ["| Status | Count |", "|---|---:|"]
+    out += [f"| {_STATUS_LABEL[s]} | {summary.get(s, 0)} |" for s in STATUSES]
+    out += [f"| **Total** | **{summary.get('total', len(tests))}** |", ""]
+
+    if results.get("overall_assessment"):
+        out += [str(results["overall_assessment"]), ""]
+
+    bugs = [b for b in results.get("bugs", []) if isinstance(b, dict)]
+    if bugs:
+        out += ["## Bugs found", ""]
+        for b in bugs:
+            where = f" ({b['test_case']})" if b.get("test_case") else ""
+            out += [f"### {b.get('title', 'Untitled')}{where}", "",
+                    f"**Severity:** {b.get('severity', 'unknown')}", ""]
+            steps = b.get("steps_to_reproduce") or []
+            if steps:
+                out += ["**Steps to reproduce:**", *[f"{n}. {s}" for n, s in enumerate(steps, 1)], ""]
+            if b.get("expected"):
+                out += [f"**Expected:** {b['expected']}", ""]
+            if b.get("actual"):
+                out += [f"**Actual:** {b['actual']}", ""]
+            if b.get("screenshot"):
+                out += [f"![{b.get('title', 'screenshot')}](screenshots/{b['screenshot']})", ""]
+
+    if problems:
+        out += ["## Failed and blocked tests", ""]
+        for r in problems:
+            out += _case_section(r)
+    if others:
+        out += ["## Other tests", ""]
+        out += [f"- {_STATUS_LABEL.get(r.get('status'), r.get('status'))} **{r['id']}** {r.get('name', '')}"
+                for r in others]
+        out.append("")
+    if results.get("agent_errors"):
+        out += ["## Agent problems", "", *[f"- {_cell(e)[:300]}" for e in results["agent_errors"]], ""]
+    if problems:
+        ids = ",".join(r["id"] for r in problems)
+        out += ["## Re-run the failures", "", f"`argus-qa test <plan.md> --only {ids}`", ""]
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _case_section(result: dict) -> list[str]:
+    label = _STATUS_LABEL.get(result.get("status"), "")
+    out = [f"### {result['id']}: {result.get('name', '')} — {label}", ""]
+    if result.get("notes"):
+        out += [str(result["notes"]), ""]
+    steps = [s for s in result.get("steps", []) if isinstance(s, dict)]
+    if steps:
+        out += ["| # | Step | Expected | Actual | |", "|---|---|---|---|---|"]
+        for n, s in enumerate(steps, 1):
+            mark = "❌" if s.get("status") == "failed" else "✅"
+            cells = " | ".join(_cell(s.get(k)) for k in ("step", "expected", "actual"))
+            out.append(f"| {n} | {cells} | {mark} |")
+        out.append("")
+        for s in steps:
+            if s.get("status") == "failed" and s.get("screenshot"):
+                out += [f"![{_cell(s.get('step'))}](screenshots/{s['screenshot']})", ""]
+    return out

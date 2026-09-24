@@ -117,6 +117,10 @@ def main():
         "--junit", default=None,
         help="Also write JUnit XML results to this path (always written to the run dir).",
     )
+    test_parser.add_argument(
+        "--ai-report", action="store_true",
+        help="Have an agent write the report (costs extra; by default it's built from the results).",
+    )
     _add_headless(test_parser)
     _add_project(test_parser)
     _add_max_cost(test_parser)
@@ -217,6 +221,7 @@ def main():
                 junit_file=args.junit,
                 project=project,
                 max_cost_usd=args.max_cost,
+                ai_report=args.ai_report,
             ))
             print(c.banner(f"Done! Report: {result.report_file}"))
             sys.exit(EXIT_TEST_FAILURES if result.failed_ids else EXIT_OK)

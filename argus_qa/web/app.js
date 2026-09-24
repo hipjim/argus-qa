@@ -111,6 +111,13 @@ function duration(run) {
 }
 
 const cost = (usd) => (usd == null ? "" : `$${usd.toFixed(2)}`);
+
+// "claude-sonnet-5" -> "Sonnet 5", "claude-opus-5-5" -> "Opus 5.5", "claude-haiku-4-5-20251001" -> "Haiku 4.5"
+function modelName(id) {
+  const m = /^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?$/.exec(id || "");
+  if (!m) return id;
+  return `${m[1][0].toUpperCase()}${m[1].slice(1)} ${m[2]}${m[3] ? `.${m[3]}` : ""}`;
+}
 const clock = (iso) => new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
 
 let toastTimer;
@@ -464,6 +471,9 @@ async function newRunView(params, alive) {
         <label class="inline-field">Parallel browsers
           <input name="parallel" type="number" min="1" max="8" value="1">
         </label>
+        <label class="inline-field" title="An agent writes the report instead of building it from the results. Costs extra.">
+          <input name="ai_report" type="checkbox" style="width:auto"> AI-written report
+        </label>
         <label class="inline-field" title="Estimated at API prices. Agents stop when the run reaches this.">Cost limit $
           <input name="max_cost" type="number" min="0.1" max="100" step="0.5" value="${DEFAULTS.test}">
         </label>
@@ -551,6 +561,7 @@ async function newRunView(params, alive) {
     const f = form.elements;
     const body = { parallel: Number(f.parallel.value) || 1 };
     if (Number(f.max_cost.value)) body.max_cost_usd = Number(f.max_cost.value);
+    if (f.ai_report.checked) body.ai_report = true;
     if (f.project.value) body.project = f.project.value;
     if (f.url.value.trim()) body.url = f.url.value.trim();
     let endpoint = "/runs";
@@ -644,6 +655,7 @@ async function runView(runId, alive) {
       `<span title="${esc(run.created_at)}">${esc(relTime(run.created_at))}</span>`,
       run.started_at ? `<span class="mono">${esc(duration(run))}</span>` : "",
       run.cost_usd != null ? `<span class="mono">${esc(cost(run.cost_usd))}</span>` : "",
+      run.models?.length ? `<span class="models" title="${esc(run.models.join(", "))}">${esc(run.models.map(modelName).join(" + "))}</span>` : "",
       `<span class="mono muted">${esc(run.id)}</span>`,
     ].filter(Boolean).join("");
 
