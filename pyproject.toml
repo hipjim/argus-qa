@@ -1,7 +1,7 @@
 [project]
 name = "argus-qa"
 version = "0.1.0"
-description = "AI-powered UI testing swarm using Claude Agent SDK and Playwright"
+description = "AI QA tester: agents that run plain-English test plans in a real browser, from the CLI or an HTTP API"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.11"
@@ -16,11 +16,24 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Testing",
 ]
 dependencies = [
     "claude-agent-sdk",
     "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+server = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+]
+dev = [
+    "argus-qa[server]",
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
 ]
 
 [project.urls]
@@ -35,5 +48,23 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["argus_qa*"]
 
+[tool.setuptools.package-data]
+argus_qa = ["web/*", "web/vendor/*"]
+
 [project.scripts]
 argus-qa = "argus_qa.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Prompts are prose; wrapping them changes what the model sees
+"argus_qa/prompts/*" = ["E501"]

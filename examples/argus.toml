@@ -1,0 +1,34 @@
+# argus-qa project file. Put it next to your test plans as argus.toml and
+# `argus-qa test` / `analyze` / `watch` pick it up automatically.
+#
+# ${VAR} values are read from the environment at run time, so this file can be
+# committed without secrets in it.
+
+name = "My SaaS App"
+url = "https://staging.myapp.com"
+description = "B2B invoicing app. Staging is reset nightly."
+
+# Followed by the tester agent in every test
+instructions = """
+- Accept the cookie banner if it appears.
+- Never click "Delete account" or anything that emails real customers.
+"""
+
+# Test accounts, by role. Plans say "Log in as admin" or use {{admin.username}} / {{admin.password}}.
+[credentials.admin]
+username = "admin@myapp.com"
+password = "${MYAPP_ADMIN_PASSWORD}"
+notes = "Can manage users"
+
+[credentials.user]
+username = "user@myapp.com"
+password = "${MYAPP_USER_PASSWORD}"
+notes = "Standard access"
+
+# Test data, usable as {{name}} in plans
+[variables]
+customer_name = "Acme Corp"
+
+# Like variables, but redacted from reports, results, and logs
+[secrets]
+test_card = "${MYAPP_TEST_CARD}"

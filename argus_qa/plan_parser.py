@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 
@@ -46,6 +47,11 @@ class TestPlan:
             cases=cases,
         )
 
+    def unknown_ids(self, ids: list[str]) -> list[str]:
+        """Return the IDs from `ids` that don't match any test case in the plan."""
+        known = {c.id.upper() for c in self.cases}
+        return [i for i in ids if i.upper() not in known]
+
     def to_markdown(self) -> str:
         """Reassemble the plan from preamble + selected cases."""
         parts = [self.preamble.rstrip()]
@@ -58,7 +64,7 @@ class TestPlan:
         if n <= 1 or len(self.cases) <= 1:
             return [self]
         chunks = []
-        size = max(1, len(self.cases) // n)
+        size = math.ceil(len(self.cases) / n)
         for i in range(0, len(self.cases), size):
             chunk_cases = self.cases[i : i + size]
             chunks.append(
@@ -84,16 +90,16 @@ _CATEGORY = re.compile(r"\*\*Category:\*\*\s*(\w+)", re.IGNORECASE)
 
 def parse_test_plan(text: str) -> TestPlan:
     """Parse a Markdown test plan into a TestPlan object."""
-    url = _extract_url(text)
-
     # Find all TC headers and their positions
     matches = list(_TC_HEADER.finditer(text))
 
     if not matches:
         # No test cases found — whole thing is preamble
-        return TestPlan(raw=text, url=url, preamble=text, cases=[])
+        return TestPlan(raw=text, url=_extract_url(text), preamble=text, cases=[])
 
     preamble = text[: matches[0].start()].rstrip()
+    # Only look for the URL in the preamble, so "URL:" inside a test step isn't picked up
+    url = _extract_url(preamble)
 
     cases: list[TestCase] = []
     for i, match in enumerate(matches):
@@ -130,3 +136,15 @@ def _extract_url(text: str) -> str | None:
         if stripped.lower().startswith("url:"):
             return stripped.split(":", 1)[1].strip()
     return None
+
+
+def plan_from_scenario(scenario: str, url: str, name: str = "Scenario") -> TestPlan:
+    """Wrap a single plain-English scenario into a one-case test plan."""
+    text = (
+        f"# Test Plan: {name}\n\n"
+        f"> URL: {url}\n\n"
+        f"## Test Cases\n\n"
+        f"### TC-001: {name}\n\n"
+        f"{scenario.strip()}\n"
+    )
+    return parse_test_plan(text)

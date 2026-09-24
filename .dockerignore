@@ -1,0 +1,8 @@
+.venv
+.git
+.claude
+reports
+argus-data
+tests
+**/__pycache__
+*.egg-info

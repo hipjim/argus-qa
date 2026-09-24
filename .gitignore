@@ -17,6 +17,8 @@ Thumbs.db
 
 # Generated artifacts
 reports/
+argus-data/
+*.rejected.md
 testplan.md
 screenshots/
 *.png
