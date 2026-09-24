@@ -6,7 +6,7 @@ import json
 import re
 from xml.etree import ElementTree as ET
 
-from argus_qa.plan_parser import TestPlan
+from argus_qa.plan_parser import TestCase, TestPlan, parse_test_plan
 
 STATUSES = ("passed", "failed", "blocked", "skipped")
 FAILING_STATUSES = ("failed", "blocked")
@@ -169,3 +169,100 @@ def _failure_detail(result: dict) -> str:
 
 def _first_line(text: str) -> str:
     return text.splitlines()[0] if text else ""
+
+
+# ── Discovery and exploration sessions ──────────────────────────────
+
+_PRIORITY_FOR_SEVERITY = {"critical": "critical", "high": "high", "medium": "medium", "low": "low"}
+
+
+def bugs_to_cases(bugs: list[dict]) -> list[TestCase]:
+    """Turn bugs found while exploring into regression test cases."""
+    blocks = []
+    for i, bug in enumerate(b for b in bugs if isinstance(b, dict)):
+        title = str(bug.get("title") or "Untitled bug").strip()
+        steps = [str(s).strip() for s in bug.get("steps_to_reproduce") or [] if str(s).strip()]
+        if bug.get("url") and not steps:
+            steps = [f"Go to {bug['url']}"]
+        severity = str(bug.get("severity") or "").lower()
+        steps = steps or ["Reproduce the scenario described below"]
+        lines = [
+            f"### TC-{i + 1:03d}: {title}",
+            "",
+            f"**Priority:** {_PRIORITY_FOR_SEVERITY.get(severity, 'medium')}",
+            "**Category:** functional",
+            "",
+            "**Steps:**",
+            *[f"{n}. {step}" for n, step in enumerate(steps, 1)],
+            "",
+            "**Expected result:**",
+            f"- {bug.get('expected') or 'The app behaves correctly'}",
+        ]
+        if bug.get("actual"):
+            lines += ["", f"_Regression check. When found, the app did this instead: {bug['actual']}_"]
+        blocks.append("\n".join(lines))
+    return parse_test_plan("\n\n".join(blocks)).cases if blocks else []
+
+
+def discovery_report(exploration: dict | None, proposed: list[TestCase], url: str) -> str:
+    """Markdown summary of a discovery session."""
+    e = exploration or {}
+    out = [f"# Discovery: {e.get('title') or url}", ""]
+    if e.get("summary"):
+        out += [str(e["summary"]), ""]
+    out += [f"**{len(proposed)}** test cases proposed from **{len(e.get('pages') or [])}** pages "
+            f"and **{len(e.get('user_flows') or [])}** user flows.", ""]
+    if e.get("pages"):
+        out += ["## Pages", "", "| Page | What it does |", "|---|---|"]
+        out += [f"| `{_cell(p.get('url'))}` | {_cell(p.get('description') or p.get('title'))} |"
+                for p in e["pages"] if isinstance(p, dict)]
+        out.append("")
+    if e.get("user_flows"):
+        out += ["## User flows", ""]
+        for flow in e["user_flows"]:
+            if isinstance(flow, dict):
+                steps = " → ".join(map(str, flow.get("steps") or []))
+                out.append(f"- **{flow.get('name', 'Flow')}**: {steps}")
+        out.append("")
+    if e.get("issues_noticed"):
+        out += ["## Issues noticed", ""]
+        out += [f"- {_cell(i.get('description'))} (`{_cell(i.get('page'))}`)"
+                for i in e["issues_noticed"] if isinstance(i, dict)]
+        out.append("")
+    if proposed:
+        out += ["## Proposed tests", ""]
+        out += [f"- **{c.id}** {c.name}" + (f" _({c.priority})_" if c.priority else "") for c in proposed]
+    return "\n".join(out).rstrip() + "\n"
+
+
+def exploration_report(data: dict, url: str) -> str:
+    """Markdown summary of an exploratory (bug-hunting) session."""
+    bugs = [b for b in data.get("bugs") or [] if isinstance(b, dict)]
+    out = [f"# Exploratory testing: {url}", ""]
+    if data.get("summary"):
+        out += [str(data["summary"]), ""]
+    if data.get("areas_covered"):
+        out += ["**Areas covered:** " + ", ".join(map(str, data["areas_covered"])), ""]
+    out += [f"## Bugs found ({len(bugs)})", ""]
+    if not bugs:
+        out += ["No bugs found in this session.", ""]
+    for i, bug in enumerate(bugs, 1):
+        where = f" · `{bug['url']}`" if bug.get("url") else ""
+        out += [f"### {i}. {bug.get('title', 'Untitled')}", "",
+                f"**Severity:** {bug.get('severity', 'unknown')}{where}", ""]
+        steps = bug.get("steps_to_reproduce") or []
+        if steps:
+            out += ["**Steps to reproduce:**", *[f"{n}. {s}" for n, s in enumerate(steps, 1)], ""]
+        if bug.get("expected"):
+            out += [f"**Expected:** {bug['expected']}", ""]
+        if bug.get("actual"):
+            out += [f"**Actual:** {bug['actual']}", ""]
+        if bug.get("screenshot"):
+            out += [f"![{bug.get('title', 'screenshot')}](screenshots/{bug['screenshot']})", ""]
+    if data.get("observations"):
+        out += ["## Observations", "", *[f"- {o}" for o in data["observations"]], ""]
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _cell(value) -> str:
+    return str(value or "").replace("|", "\\|").replace("\n", " ")

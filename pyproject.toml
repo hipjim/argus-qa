@@ -68,3 +68,5 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.ruff.lint.per-file-ignores]
 # Prompts are prose; wrapping them changes what the model sees
 "argus_qa/prompts/*" = ["E501"]
+# Tests are full of JSON literals; readability beats wrapping
+"tests/*" = ["E501"]

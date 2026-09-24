@@ -30,6 +30,13 @@ def _add_project(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_max_cost(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--max-cost", type=float, default=None, metavar="USD",
+        help="Stop agents once the estimated cost (at API prices) reaches this many dollars.",
+    )
+
+
 def _load_project(path: str | None) -> Project | None:
     """Load the project file given, or ./argus.toml if it exists; expand ${ENV} references."""
     project_path = Path(path) if path else find_project_file()
@@ -68,8 +75,13 @@ def main():
         "-o", "--output", default="testplan.md",
         help="Output path for the test plan (default: testplan.md).",
     )
+    analyze_parser.add_argument(
+        "--focus", default="",
+        help="What to concentrate on, e.g. 'the checkout flow' (default: the whole app).",
+    )
     _add_headless(analyze_parser)
     _add_project(analyze_parser)
+    _add_max_cost(analyze_parser)
 
     # ── test ─────────────────────────────────────────────────────
     test_parser = subparsers.add_parser(
@@ -107,6 +119,7 @@ def main():
     )
     _add_headless(test_parser)
     _add_project(test_parser)
+    _add_max_cost(test_parser)
 
     # ── watch ────────────────────────────────────────────────────
     watch_parser = subparsers.add_parser(
@@ -132,6 +145,7 @@ def main():
     )
     _add_headless(watch_parser)
     _add_project(watch_parser)
+    _add_max_cost(watch_parser)
 
     # ── setup ────────────────────────────────────────────────────
     subparsers.add_parser(
@@ -168,6 +182,7 @@ def main():
                 credentials = {"username": args.username, "password": args.password or ""}
             result = asyncio.run(run_analyze(
                 args.url, args.output, credentials, headless=args.headless, project=project,
+                focus=args.focus, max_cost_usd=args.max_cost,
             ))
             print(c.banner(f"Done! Test plan scaffold: {result}"))
             print("\n  Edit it, then run:")
@@ -201,6 +216,7 @@ def main():
                 headless=args.headless,
                 junit_file=args.junit,
                 project=project,
+                max_cost_usd=args.max_cost,
             ))
             print(c.banner(f"Done! Report: {result.report_file}"))
             sys.exit(EXIT_TEST_FAILURES if result.failed_ids else EXIT_OK)
@@ -220,6 +236,7 @@ def main():
                 parallel=args.parallel,
                 headless=args.headless,
                 project=project,
+                max_cost_usd=args.max_cost,
             ))
 
         elif args.command == "setup":

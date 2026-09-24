@@ -173,3 +173,97 @@ async def test_execute_plan_rejects_unknown_placeholders_before_running(project,
     plan = parse_test_plan("### TC-001: X\n\n1. Use {{missing_value}}\n")
     with pytest.raises(ValueError, match="missing_value"):
         await orchestrator.execute_plan(plan, project.url, tmp_path / "run", project=project)
+
+
+# ── discover / explore sessions (orchestrator level) ────────
+
+
+EXPLORATION = {
+    "title": "Looma Retailers", "summary": "Merchant platform",
+    "pages": [{"url": "/promos", "description": "Promotions list"}],
+    "user_flows": [{"name": "Create promo", "steps": ["Open", "Fill", "Save"]}],
+}
+SCAFFOLD = "# Test Plan: X\n\n### TC-001: Promotions list loads\n\n**Priority:** high\n\n1. Log in as admin\n"
+
+
+async def test_discover_app(project, tmp_path, monkeypatch):
+    seen = []
+
+    async def fake_agent(prompt, options, label="", redact=None):
+        seen.append((label, prompt, options))
+        if label == "scaffold":
+            return orchestrator.AgentRun(text=SCAFFOLD, ok=True, cost_usd=0.1)
+        return orchestrator.AgentRun(text=json.dumps(EXPLORATION), ok=True, cost_usd=0.9)
+
+    monkeypatch.setattr(orchestrator, "_run_agent", fake_agent)
+    result = await orchestrator.discover_app(
+        project.url, tmp_path / "d", project=project, focus="promotions",
+        existing_tests=["Old test"], max_cost_usd=2.0,
+    )
+    assert [c.name for c in result.proposed] == ["Promotions list loads"]
+    assert result.summary == {"proposed": 1, "pages": 1, "flows": 1}
+    assert result.cost_usd == pytest.approx(1.0)
+    assert "Promotions list loads" in (tmp_path / "d" / "proposed.md").read_text()
+    assert "Looma Retailers" in (tmp_path / "d" / "report.md").read_text()
+
+    (explorer_label, explorer_prompt, explorer_opts), (_, scaffold_prompt, scaffold_opts) = seen
+    assert "promotions" in explorer_prompt
+    assert "Stay on staging.looma.test" in explorer_prompt       # safety rules
+    assert "admin-secret-9" in explorer_prompt                    # explorer may log in
+    assert explorer_opts.max_budget_usd == pytest.approx(1.6)
+    assert explorer_opts.max_turns == orchestrator.EXPLORER_MAX_TURNS
+    assert scaffold_opts.max_budget_usd == pytest.approx(0.4)
+    assert "Old test" in scaffold_prompt and "Do NOT include a Credentials section" in scaffold_prompt
+
+
+async def test_discover_app_reports_browser_failure(project, tmp_path, monkeypatch):
+    async def broken(prompt, options, label="", redact=None):
+        return orchestrator.AgentRun(text=json.dumps({"environment_error": "no browser"}), ok=True)
+
+    monkeypatch.setattr(orchestrator, "_run_agent", broken)
+    result = await orchestrator.discover_app(project.url, tmp_path / "d", project=project)
+    assert result.environment_error == "no browser"
+    assert result.proposed == []
+
+
+async def test_explore_app_turns_bugs_into_tests(project, tmp_path, monkeypatch):
+    report = {
+        "summary": "Poked at promos",
+        "areas_covered": ["Promotions"],
+        "bugs": [{"title": "Save does nothing", "severity": "high", "steps_to_reproduce": ["Open /promos", "Click Save"],
+                  "expected": "Saved", "actual": "Nothing (typed admin-secret-9)"}],
+        "observations": ["Wording is unclear"],
+    }
+    prompts = []
+
+    async def fake_agent(prompt, options, label="", redact=None):
+        prompts.append((prompt, options))
+        text = json.dumps(report)
+        return orchestrator.AgentRun(text=redact(text) if redact else text, ok=True, cost_usd=0.4)
+
+    monkeypatch.setattr(orchestrator, "_run_agent", fake_agent)
+    result = await orchestrator.explore_app(
+        project.url, tmp_path / "e", charter="Break promos", project=project, max_cost_usd=1.0
+    )
+    assert result.summary == {"bugs": 1, "proposed": 1}
+    assert result.proposed[0].name == "Save does nothing" and result.proposed[0].priority == "high"
+    assert "Break promos" in prompts[0][0] and prompts[0][1].max_budget_usd == 1.0
+    for f in (tmp_path / "e").rglob("*.*"):
+        assert "admin-secret-9" not in f.read_text(), f
+    assert "Save does nothing" in (tmp_path / "e" / "report.md").read_text()
+
+
+async def test_explore_app_without_report_is_an_error(project, tmp_path, monkeypatch):
+    async def stopped(prompt, options, label="", redact=None):
+        return orchestrator.AgentRun(text="Agent error: error_max_budget_usd", ok=False)
+
+    monkeypatch.setattr(orchestrator, "_run_agent", stopped)
+    with pytest.raises(RuntimeError, match="no report"):
+        await orchestrator.explore_app(project.url, tmp_path / "e", charter="x", project=project)
+
+
+def test_budget_split_for_test_runs():
+    opts = orchestrator._browser_options(max_budget_usd=orchestrator._share(5.0, 0.9 / 3))
+    assert opts.max_budget_usd == pytest.approx(1.5)
+    assert orchestrator._browser_options().max_budget_usd is None
+    assert orchestrator._reasoning_options(max_budget_usd=0.5).max_turns == orchestrator.REPORTER_MAX_TURNS

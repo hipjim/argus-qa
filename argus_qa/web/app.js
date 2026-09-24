@@ -5,6 +5,8 @@ const KEY_STORAGE = "argus.apiKey";
 const ACTIVE = new Set(["queued", "running"]);
 const FEED_POLL_MS = 1500;
 const LIST_POLL_MS = 4000;
+// Default cost limits per kind of run; replaced by the server's values at boot
+const DEFAULTS = { test: 5, discover: 3, explore: 2 };
 
 // ── Utilities ────────────────────────────────────────────────────────
 
@@ -220,7 +222,9 @@ async function route() {
   try {
     if (parts[0] === "runs" && parts[1] === "new") await newRunView(params, alive);
     else if (parts[0] === "runs" && parts[1]) await runView(parts[1], alive);
-    else if (parts[0] === "projects" && parts[1]) await projectView(parts[1] === "new" ? null : parts[1], alive);
+    else if (parts[0] === "projects" && parts[2] === "suites") await suiteView(parts[1], parts[3] === "new" ? null : parts[3], alive);
+    else if (parts[0] === "projects" && (parts[2] === "discover" || parts[2] === "explore")) await sessionView(parts[1], parts[2], alive);
+    else if (parts[0] === "projects" && parts[1]) await projectView(parts[1] === "new" ? null : parts[1], params, alive);
     else if (parts[0] === "projects") await projectsView(alive);
     else await runsView(params, alive);
   } catch (e) {
@@ -310,10 +314,10 @@ async function runsView(params, alive) {
       <tbody>${list.map((r) => `
         <tr data-id="${esc(r.id)}">
           <td>${statusBadge(r.status)}</td>
-          <td><a class="row-link" href="#/runs/${esc(r.id)}"><div class="title">${esc(r.title || r.test_ids.join(", "))}</div>
+          <td><a class="row-link" href="#/runs/${esc(r.id)}"><div class="title">${r.kind !== "test" ? `<span class="kind ${esc(r.kind)}">${r.kind === "discover" ? "Discover" : "Explore"}</span>` : ""}${esc(r.kind !== "test" ? (r.brief || "Whole app") : (r.title || r.test_ids.join(", ")))}</div>
             <div class="id">${esc(r.id)} · ${esc(new URL(r.url).host)}</div></a></td>
           <td class="hide-sm">${r.project ? esc(names[r.project] || r.project) : '<span class="muted">—</span>'}</td>
-          <td>${r.summary ? `<div style="display:grid;gap:6px">${tallyBar(r.summary)}${tally(r.summary)}</div>`
+          <td>${r.kind !== "test" ? `<span class="small">${sessionOutcome(r)}</span>` : r.summary ? `<div style="display:grid;gap:6px">${tallyBar(r.summary)}${tally(r.summary)}</div>`
             : `<span class="muted small">${r.test_ids.length} test${r.test_ids.length === 1 ? "" : "s"}</span>`}</td>
           <td class="num hide-sm" title="${esc(r.created_at)}">${esc(relTime(r.created_at))}</td>
           <td class="num hide-sm">${esc(duration(r))}</td>
@@ -373,6 +377,7 @@ async function newRunView(params, alive) {
         <div class="segmented" role="group" aria-label="Input type">
           <button type="button" data-mode="scenario" aria-pressed="true">Scenario</button>
           <button type="button" data-mode="plan" aria-pressed="false">Test plan</button>
+          <button type="button" data-mode="suite" aria-pressed="false" id="suite-mode-btn" hidden>Saved suite</button>
         </div>
       </div>
 
@@ -397,6 +402,11 @@ async function newRunView(params, alive) {
         </div>
       </div>
 
+      <div id="mode-suite" class="form" style="gap:16px" hidden>
+        <label class="field"><span>Suite</span><select name="suite"></select>
+          <span class="hint" id="suite-hint"></span></label>
+      </div>
+
       <div class="field" id="placeholders" hidden>
         <span>Project values</span>
         <div class="chips" id="placeholder-chips"></div>
@@ -411,6 +421,9 @@ async function newRunView(params, alive) {
         <label class="inline-field">Parallel browsers
           <input name="parallel" type="number" min="1" max="8" value="1">
         </label>
+        <label class="inline-field" title="Estimated at API prices. Agents stop when the run reaches this.">Cost limit $
+          <input name="max_cost" type="number" min="0.1" max="100" step="0.5" value="${DEFAULTS.test}">
+        </label>
       </div>
     </form>`;
 
@@ -421,7 +434,32 @@ async function newRunView(params, alive) {
 
   form.querySelectorAll("textarea").forEach((t) => t.addEventListener("focus", () => { lastFocused = t; }));
 
+  let suites = [];
+  const setMode = (next) => {
+    mode = next;
+    view.querySelectorAll("[data-mode]").forEach((x) => x.setAttribute("aria-pressed", String(x.dataset.mode === mode)));
+    view.querySelector("#mode-scenario").hidden = mode !== "scenario";
+    view.querySelector("#mode-plan").hidden = mode !== "plan";
+    view.querySelector("#mode-suite").hidden = mode !== "suite";
+    view.querySelector("#placeholders").classList.toggle("off", mode === "suite");
+    lastFocused = mode === "plan" ? form.elements.plan : form.elements.scenario;
+  };
+  const syncSuites = async () => {
+    const slug = form.elements.project.value;
+    suites = slug ? await api(`/projects/${encodeURIComponent(slug)}/suites`).catch(() => []) : [];
+    if (!alive() || slug !== form.elements.project.value) return;
+    view.querySelector("#suite-mode-btn").hidden = !suites.length;
+    form.elements.suite.innerHTML = suites.map((st) => `<option value="${esc(st.slug)}">${esc(st.name)} (${st.test_count} test${st.test_count === 1 ? "" : "s"})</option>`).join("");
+    const preferred = params.get("suite");
+    if (preferred && suites.some((st) => st.slug === preferred)) {
+      form.elements.suite.value = preferred;
+      setMode("suite");
+    } else if (mode === "suite" && !suites.length) {
+      setMode("scenario");
+    }
+  };
   const syncProject = () => {
+    syncSuites();
     const p = byName[form.elements.project.value];
     form.elements.url.placeholder = p?.url || "https://staging.example.com";
     view.querySelector("#url-hint").textContent = p?.url ? "Leave empty to use the project's URL." : "";
@@ -446,13 +484,7 @@ async function newRunView(params, alive) {
     t.selectionStart = t.selectionEnd = at + text.length;
   });
 
-  view.querySelectorAll("[data-mode]").forEach((b) => b.addEventListener("click", () => {
-    mode = b.dataset.mode;
-    view.querySelectorAll("[data-mode]").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
-    view.querySelector("#mode-scenario").hidden = mode !== "scenario";
-    view.querySelector("#mode-plan").hidden = mode !== "plan";
-    lastFocused = mode === "plan" ? form.elements.plan : form.elements.scenario;
-  }));
+  view.querySelectorAll("[data-mode]").forEach((b) => b.addEventListener("click", () => setMode(b.dataset.mode)));
 
   const detect = () => {
     const ids = [...form.elements.plan.value.matchAll(/^###\s+(TC-\d+)\s*:\s*(.+)$/gm)].map((m) => m[1]);
@@ -475,9 +507,14 @@ async function newRunView(params, alive) {
     err.hidden = true;
     const f = form.elements;
     const body = { parallel: Number(f.parallel.value) || 1 };
+    if (Number(f.max_cost.value)) body.max_cost_usd = Number(f.max_cost.value);
     if (f.project.value) body.project = f.project.value;
     if (f.url.value.trim()) body.url = f.url.value.trim();
-    if (mode === "scenario") {
+    let endpoint = "/runs";
+    if (mode === "suite") {
+      endpoint = `/projects/${encodeURIComponent(f.project.value)}/suites/${encodeURIComponent(f.suite.value)}/run`;
+      delete body.project;
+    } else if (mode === "scenario") {
       body.scenario = f.scenario.value;
       if (f.name.value.trim()) body.name = f.name.value.trim();
     } else {
@@ -489,7 +526,7 @@ async function newRunView(params, alive) {
     btn.disabled = true;
     btn.textContent = "Starting…";
     try {
-      const run = await api("/runs", { method: "POST", body });
+      const run = await api(endpoint, { method: "POST", body });
       location.hash = `#/runs/${run.id}`;
     } catch (ex) {
       err.textContent = ex.message;
@@ -507,9 +544,13 @@ async function runView(runId, alive) {
   let run = await api(`/runs/${runId}`);
   if (!alive()) return;
 
+  const session = run.kind !== "test";
   let results = null;
+  let exploration = null;
+  let proposed = null;
+  let suiteChoices = null;
   let shots = [];
-  let tab = "tests";
+  let tab = run.kind === "explore" ? "bugs" : run.kind === "discover" ? "proposed" : "tests";
   let reportHtml = null;
   let planText = null;
   let feedCursor = 0;
@@ -550,9 +591,10 @@ async function runView(runId, alive) {
     const onlyCase = results?.results?.length === 1 ? results.results[0].name : "";
     const title = run.title || onlyCase || run.test_ids.join(", ");
     $("#run-title").textContent = title;
-    const mark = { running: "●", queued: "○", passed: "✓", failed: "✗", error: "!" }[run.status] || "";
+    const mark = { running: "●", queued: "○", passed: "✓", completed: "✓", failed: "✗", error: "!" }[run.status] || "";
     document.title = `${mark} ${run.status === "running" ? "Running" : run.status[0].toUpperCase() + run.status.slice(1)} · ${title} — argus-qa`.trim();
     $("#run-meta").innerHTML = [
+      session ? `<span class="kind ${esc(run.kind)}">${run.kind === "discover" ? "Discover" : "Explore"}</span>` : "",
       statusBadge(run.status),
       run.project ? `<a href="#/projects/${esc(run.project)}">${esc(run.project)}</a>` : "",
       `<a class="mono" href="${esc(run.url)}" target="_blank" rel="noopener">${esc(run.url)}</a>`,
@@ -564,11 +606,11 @@ async function runView(runId, alive) {
 
     const actions = [];
     if (ACTIVE.has(run.status)) actions.push(`<button class="btn btn-danger" data-act="cancel">Cancel run</button>`);
-    if (!ACTIVE.has(run.status)) {
+    if (!ACTIVE.has(run.status) && !session) {
       if (run.failed_ids.length) actions.push(`<button class="btn btn-primary" data-act="rerun-failed">Re-run ${run.failed_ids.length} failed</button>`);
       actions.push(`<button class="btn" data-act="rerun-all">Re-run all</button>`);
     }
-    if (results) {
+    if (results && !session) {
       actions.push(`<button class="btn btn-ghost btn-small" data-act="dl-junit">junit.xml</button>`);
       actions.push(`<button class="btn btn-ghost btn-small" data-act="dl-results">results.json</button>`);
     }
@@ -580,9 +622,17 @@ async function runView(runId, alive) {
 
     const s = run.summary || { passed: 0, failed: 0, blocked: 0, skipped: 0 };
     const score = (cls, n, label) => `<div class="score ${cls} ${n ? "" : "zero"}"><b>${n}</b><span>${label}</span></div>`;
-    $("#scoreboard").innerHTML = run.summary
+    const saved = run.accepted?.length || 0;
+    $("#scoreboard").innerHTML = session && run.summary
+      ? (run.kind === "discover"
+        ? score("", run.summary.proposed || 0, "Tests proposed") + score("", run.summary.pages || 0, "Pages mapped")
+          + score("", run.summary.flows || 0, "User flows") + score("p", saved, "Saved to suites")
+        : score("f", run.summary.bugs || 0, "Bugs found") + score("", run.summary.proposed || 0, "Regression tests")
+          + score("", shots.filter(isImage).length, "Screenshots") + score("p", saved, "Saved to suites"))
+      : run.summary
       ? score("p", s.passed, "Passed") + score("f", s.failed, "Failed") + score("b", s.blocked, "Blocked") + score("s", s.skipped, "Skipped")
-      : score("", run.test_ids.length, run.test_ids.length === 1 ? "Test" : "Tests")
+      : (session ? score("", run.max_cost_usd ? cost(run.max_cost_usd) : "—", "Cost limit")
+        : score("", run.test_ids.length, run.test_ids.length === 1 ? "Test" : "Tests"))
         + score("", shots.filter(isImage).length, "Screenshots")
         + score("", actionCount, "Browser actions")
         + score("", duration(run) || "—", "Elapsed");
@@ -613,7 +663,12 @@ async function runView(runId, alive) {
 
   const drawTabs = () => {
     const images = shots.filter(isImage).length;
-    const defs = [["tests", "Tests", run.test_ids.length], ["report", "Report"], ["screenshots", "Screenshots", images], ["plan", "Plan"]];
+    const nProposed = run.status === "completed" ? run.test_ids.length : 0;
+    const defs = run.kind === "discover"
+      ? [["proposed", "Proposed tests", nProposed], ["map", "App map"], ["report", "Report"], ["screenshots", "Screenshots", images]]
+      : run.kind === "explore"
+        ? [["bugs", "Bugs", run.summary?.bugs], ["proposed", "Regression tests", nProposed], ["report", "Report"], ["screenshots", "Screenshots", images]]
+        : [["tests", "Tests", run.test_ids.length], ["report", "Report"], ["screenshots", "Screenshots", images], ["plan", "Plan"]];
     $("#tabs").innerHTML = defs.map(([id, label, count]) =>
       `<button role="tab" data-tab="${id}" aria-selected="${tab === id}">${label}${count ? `<span class="count">${count}</span>` : ""}</button>`).join("");
   };
@@ -672,9 +727,137 @@ async function runView(runId, alive) {
     return (bugs ? `<section class="bugs"><h2 class="section-label">Bugs found</h2>${bugs}</section>` : "") + cases;
   };
 
+  const waiting = (what) => `<p class="muted">${ACTIVE.has(run.status)
+    ? `${what} appear here when the agent finishes. Watch it work in the activity panel.`
+    : run.status === "completed" ? `No ${what.toLowerCase()} in this session.` : `This session ended without ${what.toLowerCase()}.`}</p>`;
+
+  const drawProposed = async (body) => {
+    if (run.status !== "completed") { body.innerHTML = waiting("Proposed tests"); return; }
+    if (proposed === null || suiteChoices === null) {
+      [proposed, suiteChoices] = await Promise.all([
+        api(`/runs/${runId}/proposed`).then((d) => d.cases),
+        api(`/projects/${encodeURIComponent(run.project)}/suites`),
+      ]);
+      if (!alive() || tab !== "proposed") return;
+    }
+    if (!proposed.length) { body.innerHTML = waiting("Proposed tests"); return; }
+    const open = proposed.filter((c) => !c.accepted);
+    const defaultName = run.kind === "explore" ? "Regression tests"
+      : run.brief ? run.brief.replace(/^./, (ch) => ch.toUpperCase()).slice(0, 48) : "Discovered tests";
+    body.innerHTML = `
+      <p class="muted small proposal-intro">${run.kind === "explore"
+        ? "Each bug found became a regression test that checks it stays fixed."
+        : "Review the proposed tests, untick any you don't want, and save the rest to a suite."}</p>
+      ${open.length ? `<label class="select-all"><input type="checkbox" id="select-all" checked> Select all</label>` : ""}
+      <ul class="proposals">${proposed.map((c) => `
+        <li class="proposal ${c.accepted ? "is-saved" : ""}">
+          <label class="proposal-head">
+            <input type="checkbox" value="${esc(c.id)}" ${c.accepted ? "checked disabled" : "checked"}>
+            <span class="case-id">${esc(c.id)}</span>
+            <span class="case-name">${esc(c.name)}</span>
+            ${c.priority ? `<span class="chip static">${esc(c.priority)}</span>` : ""}
+            ${c.accepted ? `<span class="saved">Saved</span>` : ""}
+          </label>
+          <details><summary>Steps and expected result</summary>
+            <div class="prose proposal-body">${renderMarkdown(c.markdown.replace(/^###.*\n/, ""))}</div></details>
+        </li>`).join("")}</ul>
+      ${open.length ? `
+      <form class="accept-bar sticky-actions" id="accept-form">
+        <span>Save <b id="n-selected">${open.length}</b> to</span>
+        <select name="target" aria-label="Suite">
+          <option value="">a new suite named…</option>
+          ${suiteChoices.map((st) => `<option value="${esc(st.slug)}">${esc(st.name)} (${st.test_count})</option>`).join("")}
+        </select>
+        <input name="suite_name" value="${esc(defaultName)}" aria-label="New suite name">
+        <button class="btn btn-primary" type="submit">Save to suite</button>
+      </form>` : `<div class="banner info">All proposed tests are saved. <a href="#/projects/${esc(run.project)}">Go to the project's suites →</a></div>`}`;
+
+    const form = body.querySelector("#accept-form");
+    if (!form) return;
+    const boxes = () => [...body.querySelectorAll(".proposal input[type=checkbox]:not(:disabled)")];
+    const sync = () => {
+      const n = boxes().filter((b) => b.checked).length;
+      body.querySelector("#n-selected").textContent = n;
+      form.querySelector("button").disabled = n === 0;
+      const all = body.querySelector("#select-all");
+      all.checked = n === boxes().length;
+      all.indeterminate = n > 0 && n < boxes().length;
+      form.elements.suite_name.hidden = Boolean(form.elements.target.value);
+    };
+    body.querySelector("#select-all").addEventListener("change", (e) => { boxes().forEach((b) => { b.checked = e.target.checked; }); sync(); });
+    boxes().forEach((b) => b.addEventListener("change", sync));
+    form.elements.target.addEventListener("change", sync);
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const ids = boxes().filter((b) => b.checked).map((b) => b.value);
+      const target = form.elements.target.value;
+      const payload = target ? { case_ids: ids, suite: target } : { case_ids: ids, suite_name: form.elements.suite_name.value.trim() };
+      form.querySelector("button").disabled = true;
+      try {
+        const suite = await api(`/runs/${runId}/accept`, { method: "POST", body: payload });
+        toast(`Saved ${ids.length} test${ids.length === 1 ? "" : "s"} to “${suite.name}”`);
+        proposed = null;
+        suiteChoices = null;
+        run = await api(`/runs/${runId}`);
+        drawHeader();
+        await drawBody();
+      } catch (ex) {
+        toast(ex.message, true);
+        form.querySelector("button").disabled = false;
+      }
+    });
+    sync();
+  };
+
+  const drawBugs = (body) => {
+    if (!results) { body.innerHTML = waiting("Bugs"); return; }
+    const bugs = results.bugs || [];
+    const images = new Set(shots.filter(isImage));
+    body.innerHTML = `
+      ${results.summary ? `<p class="session-summary">${esc(results.summary)}</p>` : ""}
+      ${(results.areas_covered || []).length ? `<p class="muted small">Areas covered: ${esc(results.areas_covered.join(", "))}</p>` : ""}
+      ${bugs.length ? bugs.map((b) => `
+        <article class="bug-card">
+          <div class="bug-card-main">
+            <div class="bug-head"><span class="sev ${esc(String(b.severity || "").toLowerCase())}">${esc(b.severity || "bug")}</span>
+              <h3>${esc(b.title)}</h3></div>
+            ${b.url ? `<p class="mono small muted">${esc(b.url)}</p>` : ""}
+            ${(b.steps_to_reproduce || []).length ? `<ol class="repro">${b.steps_to_reproduce.map((st) => `<li>${esc(st)}</li>`).join("")}</ol>` : ""}
+            <dl class="step-ea">
+              ${b.expected ? `<dt>Expected</dt><dd>${esc(b.expected)}</dd>` : ""}
+              ${b.actual ? `<dt>Actual</dt><dd class="actual">${esc(b.actual)}</dd>` : ""}
+            </dl>
+          </div>
+          ${b.screenshot && images.has(b.screenshot) ? `<div>${thumb(b.screenshot, b.title)}</div>` : ""}
+        </article>`).join("") : `<div class="banner info">No bugs found in this session.</div>`}
+      ${(results.observations || []).length ? `<h2 class="section-label" style="margin-top:28px">Observations</h2>
+        <ul class="observations">${results.observations.map((o) => `<li>${esc(o)}</li>`).join("")}</ul>` : ""}`;
+  };
+
+  const drawMap = (body) => {
+    if (!exploration) { body.innerHTML = waiting("The app map will"); return; }
+    const e = exploration;
+    body.innerHTML = `
+      ${e.summary ? `<p class="session-summary">${esc(e.summary)}</p>` : ""}
+      ${(e.pages || []).length ? `<h2 class="section-label">Pages</h2>
+        <table class="table map-table"><tbody>${e.pages.map((pg) => `
+          <tr><td class="mono small">${esc(pg.url)}</td><td><b>${esc(pg.title || "")}</b><div class="muted small">${esc(pg.description || "")}</div></td></tr>`).join("")}</tbody></table>` : ""}
+      ${(e.user_flows || []).length ? `<h2 class="section-label" style="margin-top:28px">User flows</h2>
+        <ul class="flows">${e.user_flows.map((f) => `<li><b>${esc(f.name)}</b><span class="muted"> — ${esc((f.steps || []).join(" → "))}</span></li>`).join("")}</ul>` : ""}
+      ${(e.issues_noticed || []).length ? `<h2 class="section-label" style="margin-top:28px">Issues noticed</h2>
+        <ul class="observations">${e.issues_noticed.map((i) => `<li>${esc(i.description)} <span class="mono small muted">${esc(i.page || "")}</span></li>`).join("")}</ul>` : ""}`;
+  };
+
   const drawBody = async () => {
     const body = $("#tab-body");
-    if (tab === "tests") {
+    if (tab === "proposed") {
+      await drawProposed(body);
+      return;
+    } else if (tab === "bugs") {
+      drawBugs(body);
+    } else if (tab === "map") {
+      drawMap(body);
+    } else if (tab === "tests") {
       body.innerHTML = drawTests();
     } else if (tab === "screenshots") {
       const images = shots.filter(isImage);
@@ -687,7 +870,7 @@ async function runView(runId, alive) {
         try {
           reportHtml = renderMarkdown(await api(`/runs/${runId}/report`));
         } catch {
-          body.innerHTML = `<p class="muted">${ACTIVE.has(run.status) ? "The report is written when all tests have finished." : "No report for this run."}</p>`;
+          body.innerHTML = `<p class="muted">${ACTIVE.has(run.status) ? "The report is written when the agent has finished." : "No report for this run."}</p>`;
           return;
         }
         if (tab !== "report" || !alive()) return;
@@ -769,8 +952,11 @@ async function runView(runId, alive) {
     if (!alive()) return;
     shots = await api(`/runs/${runId}/screenshots`).catch(() => shots);
     // Results only exist once the run has finished
-    if (!ACTIVE.has(run.status) && (!results || wasActive)) {
+    if (!ACTIVE.has(run.status) && (!results || wasActive) && run.kind !== "discover") {
       results = await api(`/runs/${runId}/results`).catch(() => results);
+    }
+    if (!ACTIVE.has(run.status) && (!exploration || wasActive) && run.kind === "discover") {
+      exploration = await api(`/runs/${runId}/exploration`).catch(() => exploration);
     }
     if (!alive()) return;
     $("#feed-state").innerHTML = ACTIVE.has(run.status) ? `<span class="live-dot">● live</span>` : esc(run.status);
@@ -779,19 +965,20 @@ async function runView(runId, alive) {
     // Redraw the tab only when what it shows has changed, so thumbnails don't flicker
     // Live progress only affects the Tests tab; other tabs mustn't redraw on every action
     const live = ACTIVE.has(run.status) && tab === "tests" ? JSON.stringify([agentCase, agentAction]) : "";
-    const signature = `${tab}|${JSON.stringify(results)?.length}|${shots.length}|${run.status}|${live}`;
+    const signature = `${tab}|${JSON.stringify(results)?.length}|${tab === "proposed" ? "" : shots.length}|${run.status}|${live}`;
     if (signature !== lastSignature) {
       lastSignature = signature;
       await drawBody();
     }
     if (wasActive && !ACTIVE.has(run.status)) {
       reportHtml = null;
+      proposed = null;
       toast(`Run ${run.status}`);
     }
     return ACTIVE.has(run.status);
   };
 
-  planText = await api(`/runs/${runId}/plan`).catch(() => "");
+  planText = session ? "" : await api(`/runs/${runId}/plan`).catch(() => "");
   for (const m of planText.matchAll(/^###\s+(TC-\d+)\s*:\s*(.+)$/gm)) caseNames[m[1].toUpperCase()] = m[2].trim();
   await pollFeed();
   await refresh();
@@ -823,7 +1010,7 @@ async function projectsView(alive) {
     <div class="page-head">
       <div>
         <h1>Projects</h1>
-        <p class="sub">An app under test: where it lives, which accounts to log in with, and rules the tester follows.</p>
+        <p class="sub">An app under test: where it lives, which accounts to log in with, its saved test suites, and rules the tester follows.</p>
       </div>
       <div class="page-head-actions"><a class="btn btn-primary" href="#/projects/new">New project</a></div>
     </div>
@@ -836,7 +1023,7 @@ async function projectsView(alive) {
       </a>`).join("")}</div>`
     : `<div class="empty">
         <h2>No projects yet</h2>
-        <p>A project keeps the URL, test accounts, and test data for an app, so a run only needs the scenario.</p>
+        <p>A project keeps the URL, test accounts, and test data for an app. Then argus-qa can discover the app and propose a test suite for it.</p>
         <a class="btn btn-primary" href="#/projects/new">Create a project</a>
       </div>`}`;
   view.querySelectorAll("[data-start]").forEach((b) => b.addEventListener("click", (e) => {
@@ -847,24 +1034,109 @@ async function projectsView(alive) {
 
 const MASK = "********";
 
-async function projectView(slug, alive) {
-  const project = slug ? await api(`/projects/${encodeURIComponent(slug)}`) : {
-    name: "", url: "", description: "", instructions: "",
-    credentials: { admin: { username: "", password: "", notes: "" } }, variables: {}, secrets: {},
-  };
+async function projectView(slug, params, alive) {
+  if (!slug) {
+    view.innerHTML = `<a class="crumb" href="#/projects">← Projects</a>
+      <div class="page-head"><div><h1>New project</h1>
+      <p class="sub">After creating it, argus-qa can explore the app and propose tests.</p></div></div>
+      <div id="settings"></div>`;
+    projectSettingsForm(view.querySelector("#settings"), {
+      name: "", url: "", description: "", instructions: "",
+      credentials: { admin: { username: "", password: "", notes: "" } }, variables: {}, secrets: {},
+    }, true);
+    return;
+  }
+
+  const tab = params.get("tab") === "settings" ? "settings" : "suites";
+  const [project, suites, sessions] = await Promise.all([
+    api(`/projects/${encodeURIComponent(slug)}`),
+    api(`/projects/${encodeURIComponent(slug)}/suites`),
+    api(`/runs?project=${encodeURIComponent(slug)}&limit=200`),
+  ]);
   if (!alive()) return;
-  const isNew = !slug;
+  const base = `#/projects/${encodeURIComponent(slug)}`;
 
   view.innerHTML = `
     <a class="crumb" href="#/projects">← Projects</a>
     <div class="page-head">
-      <div><h1>${isNew ? "New project" : esc(project.name)}</h1>
-        ${isNew ? "" : `<p class="sub mono">${esc(project.slug)}</p>`}</div>
+      <div><h1>${esc(project.name)}</h1>
+        <p class="sub"><span class="mono">${esc(project.slug)}</span>${project.url ? ` · <a class="mono" href="${esc(project.url)}" target="_blank" rel="noopener">${esc(project.url)}</a>` : ""}</p></div>
       <div class="page-head-actions">
-        ${isNew ? "" : `<a class="btn" href="#/runs?project=${esc(project.slug)}">Runs</a>
-          <a class="btn btn-primary" href="#/runs/new?project=${esc(project.slug)}">Start run</a>`}
+        <a class="btn" href="${base}/explore">Explore for bugs</a>
+        <a class="btn" href="${base}/discover">Discover tests</a>
+        <a class="btn btn-primary" href="#/runs/new?project=${esc(project.slug)}">New run</a>
       </div>
     </div>
+    <div class="tabs" role="tablist">
+      <a role="tab" href="${base}" aria-selected="${tab === "suites"}">Test suites<span class="count">${suites.length || ""}</span></a>
+      <a role="tab" href="${base}?tab=settings" aria-selected="${tab === "settings"}">Settings</a>
+    </div>
+    <div id="project-body"></div>`;
+
+  const body = view.querySelector("#project-body");
+  if (tab === "settings") {
+    projectSettingsForm(body, project, false);
+    return;
+  }
+
+  const sessionRuns = sessions.filter((r) => r.kind !== "test").slice(0, 8);
+  body.innerHTML = `
+    ${suites.length ? `<div class="suites">${suites.map((s) => `
+      <div class="suite-row">
+        <a class="suite-main" href="${base}/suites/${esc(s.slug)}">
+          <span class="name">${esc(s.name)}</span>
+          <span class="muted small">${s.test_count} test${s.test_count === 1 ? "" : "s"} · updated ${esc(relTime(s.updated_at))}</span>
+        </a>
+        <div class="suite-last">${s.last_run
+          ? `<a href="#/runs/${esc(s.last_run.id)}">${statusBadge(s.last_run.status)}</a> <span class="muted small">${esc(relTime(s.last_run.created_at))}</span>`
+          : '<span class="muted small">Never run</span>'}</div>
+        <button class="btn btn-small btn-primary" data-run-suite="${esc(s.slug)}">Run</button>
+      </div>`).join("")}</div>
+      <div class="suite-actions"><a class="btn btn-small" href="${base}/suites/new">New suite</a></div>`
+    : `<div class="empty">
+        <h2>No test suites yet</h2>
+        <p>Let argus-qa explore ${esc(project.url ? new URL(project.url).host : "the app")} and propose test cases. You review them and keep the ones you want.</p>
+        <a class="btn btn-primary" href="${base}/discover">Discover tests</a>
+        <a class="btn" href="${base}/suites/new">Write a suite</a>
+      </div>`}
+    ${sessionRuns.length ? `
+      <h2 class="section-label" style="margin-top:36px">Discovery and exploration</h2>
+      <div class="sessions">${sessionRuns.map((r) => `
+        <a class="session-row" href="#/runs/${esc(r.id)}">
+          <span class="kind ${esc(r.kind)}">${r.kind === "discover" ? "Discover" : "Explore"}</span>
+          <span class="session-brief">${esc(r.brief || "Whole app")}</span>
+          <span class="small">${sessionOutcome(r)}</span>
+          <span class="muted small">${esc(relTime(r.created_at))}</span>
+        </a>`).join("")}</div>` : ""}`;
+
+  body.addEventListener("click", async (e) => {
+    const suiteSlug = e.target.closest("[data-run-suite]")?.dataset.runSuite;
+    if (!suiteSlug) return;
+    e.target.disabled = true;
+    try {
+      const run = await api(`/projects/${encodeURIComponent(slug)}/suites/${encodeURIComponent(suiteSlug)}/run`, { method: "POST", body: {} });
+      location.hash = `#/runs/${run.id}`;
+    } catch (ex) {
+      toast(ex.message, true);
+      e.target.disabled = false;
+    }
+  });
+}
+
+function sessionOutcome(run) {
+  if (ACTIVE.has(run.status)) return statusBadge(run.status);
+  if (run.status !== "completed") return statusBadge(run.status);
+  const s = run.summary || {};
+  const accepted = run.accepted?.length ? ` · ${run.accepted.length} saved` : "";
+  if (run.kind === "explore") {
+    return `<span class="${s.bugs ? "text-fail" : "text-pass"}">${s.bugs || 0} bug${s.bugs === 1 ? "" : "s"} found</span>${accepted}`;
+  }
+  return `${s.proposed || 0} tests proposed${accepted}`;
+}
+
+function projectSettingsForm(container, project, isNew) {
+  const slug = project.slug;
+  container.innerHTML = `
     <form class="form" id="project-form" novalidate>
       <div class="form-row">
         <label class="field"><span>Name</span><input name="name" required value="${esc(project.name)}" placeholder="Looma staging"></label>
@@ -876,7 +1148,7 @@ async function projectView(slug, alive) {
       <label class="field"><span>Description</span><input name="description" value="${esc(project.description)}" placeholder="What the app is, anything the tester should know"></label>
       <label class="field"><span>Standing instructions</span>
         <textarea name="instructions" rows="4" placeholder="- Accept the cookie banner if it appears.&#10;- Never click Delete account.">${esc(project.instructions)}</textarea>
-        <span class="hint">Followed by the tester in every test.</span></label>
+        <span class="hint">Followed by the tester in every test, discovery, and exploration.</span></label>
 
       <fieldset>
         <legend>Test accounts</legend>
@@ -904,13 +1176,13 @@ async function projectView(slug, alive) {
       <p class="form-error" id="form-error" hidden></p>
       <div class="form-actions sticky-actions">
         <button class="btn btn-primary" type="submit">${isNew ? "Create project" : "Save changes"}</button>
-        <a class="btn btn-ghost" href="#/projects">Cancel</a>
+        <a class="btn btn-ghost" href="${isNew ? "#/projects" : `#/projects/${esc(slug)}`}">Cancel</a>
         <span class="spacer"></span>
         ${isNew ? "" : `<button class="btn btn-danger" type="button" id="delete-btn">Delete project</button>`}
       </div>
     </form>`;
 
-  const $ = (sel) => view.querySelector(sel);
+  const $ = (sel) => container.querySelector(sel);
   const removeBtn = `<button type="button" class="icon-btn" data-remove aria-label="Remove"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>`;
   const secretInput = (value, name) =>
     `<input type="password" name="${name}" value="${esc(value)}" autocomplete="new-password" placeholder="${value === MASK ? "" : "password"}"
@@ -984,7 +1256,7 @@ async function projectView(slug, alive) {
   });
 
   $("#delete-btn")?.addEventListener("click", async () => {
-    if (!confirm(`Delete project “${project.name}”? Its past runs are kept.`)) return;
+    if (!confirm(`Delete project “${project.name}” and its test suites? Past runs are kept.`)) return;
     try {
       await api(`/projects/${encodeURIComponent(slug)}`, { method: "DELETE" });
       toast("Project deleted");
@@ -993,8 +1265,203 @@ async function projectView(slug, alive) {
       toast(ex.message, true);
     }
   });
-  const first = form.elements.name;
-  if (!first.value) first.focus();
+  if (isNew) form.elements.name.focus();
+}
+
+// ── Suites ───────────────────────────────────────────────────────────
+
+const SUITE_EXAMPLE = `### TC-001: Retailer can log in
+
+**Priority:** critical
+
+**Steps:**
+1. Log in as retailer
+
+**Expected result:**
+- The dashboard is shown
+
+---
+
+### TC-002: …`;
+
+async function suiteView(slug, suiteSlug, alive) {
+  const isNew = !suiteSlug;
+  const [project, suite, runs] = await Promise.all([
+    api(`/projects/${encodeURIComponent(slug)}`),
+    isNew ? null : api(`/projects/${encodeURIComponent(slug)}/suites/${encodeURIComponent(suiteSlug)}`),
+    isNew ? [] : api(`/runs?project=${encodeURIComponent(slug)}&suite=${encodeURIComponent(suiteSlug)}&limit=10`),
+  ]);
+  if (!alive()) return;
+  const base = `#/projects/${encodeURIComponent(slug)}`;
+
+  view.innerHTML = `
+    <a class="crumb" href="${base}">← ${esc(project.name)}</a>
+    <div class="page-head">
+      <div><h1>${isNew ? "New test suite" : esc(suite.name)}</h1>
+        <p class="sub">${isNew ? "A saved set of test cases you can run with one click." : `${suite.test_count} test${suite.test_count === 1 ? "" : "s"} · updated ${esc(relTime(suite.updated_at))}`}</p></div>
+      ${isNew ? "" : `<div class="page-head-actions">
+        <label class="inline-field">Parallel <input id="suite-parallel" type="number" min="1" max="8" value="1"></label>
+        <button class="btn btn-primary" id="run-suite">Run suite</button>
+      </div>`}
+    </div>
+    <div class="run-grid ${runs.length ? "" : "no-feed"}">
+      <form class="form" id="suite-form" novalidate>
+        <label class="field"><span>Name</span><input name="name" required value="${esc(suite?.name || "")}" placeholder="Smoke tests"></label>
+        <label class="field"><span>Test cases (Markdown)</span>
+          <textarea name="plan" rows="22" placeholder="${esc(SUITE_EXAMPLE)}">${esc(suite?.plan || "")}</textarea>
+          <span class="detected" id="detected"></span>
+        </label>
+        <p class="form-error" id="form-error" hidden></p>
+        <div class="form-actions sticky-actions">
+          <button class="btn btn-primary" type="submit">${isNew ? "Create suite" : "Save changes"}</button>
+          <a class="btn btn-ghost" href="${base}">Cancel</a>
+          <span class="spacer"></span>
+          ${isNew ? "" : `<button class="btn btn-danger" type="button" id="delete-suite">Delete suite</button>`}
+        </div>
+      </form>
+      <aside class="side-list" aria-label="Recent runs">
+        <h2 class="section-label">Recent runs</h2>
+        ${runs.map((r) => `<a class="side-row" href="#/runs/${esc(r.id)}">${statusBadge(r.status)}
+          <span>${r.summary ? tally(r.summary) : ""}</span><span class="muted small">${esc(relTime(r.created_at))}</span></a>`).join("")}
+      </aside>
+    </div>`;
+
+  const form = view.querySelector("#suite-form");
+  const detect = () => {
+    const ids = [...form.elements.plan.value.matchAll(/^###\s+(TC-\d+)\s*:\s*(.+)$/gm)].map((m) => m[1]);
+    view.querySelector("#detected").innerHTML = form.elements.plan.value.trim()
+      ? (ids.length ? `<b>${ids.length}</b> test case${ids.length === 1 ? "" : "s"}: ${esc(ids.join(", "))}`
+        : "No test cases found. Each needs a heading like <b>### TC-001: Title</b>.")
+      : "";
+  };
+  form.elements.plan.addEventListener("input", detect);
+  detect();
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const err = view.querySelector("#form-error");
+    err.hidden = true;
+    const body = { name: form.elements.name.value.trim(), plan: form.elements.plan.value };
+    try {
+      const saved = isNew
+        ? await api(`/projects/${encodeURIComponent(slug)}/suites`, { method: "POST", body })
+        : await api(`/projects/${encodeURIComponent(slug)}/suites/${encodeURIComponent(suiteSlug)}`, { method: "PUT", body });
+      toast(isNew ? "Suite created" : "Saved");
+      if (isNew) location.hash = `${base}/suites/${saved.slug}`;
+      else route();
+    } catch (ex) {
+      err.textContent = ex.message;
+      err.hidden = false;
+    }
+  });
+
+  view.querySelector("#run-suite")?.addEventListener("click", async (e) => {
+    e.target.disabled = true;
+    try {
+      const run = await api(`/projects/${encodeURIComponent(slug)}/suites/${encodeURIComponent(suiteSlug)}/run`, {
+        method: "POST", body: { parallel: Number(view.querySelector("#suite-parallel").value) || 1 },
+      });
+      location.hash = `#/runs/${run.id}`;
+    } catch (ex) {
+      toast(ex.message, true);
+      e.target.disabled = false;
+    }
+  });
+
+  view.querySelector("#delete-suite")?.addEventListener("click", async () => {
+    if (!confirm(`Delete the suite “${suite.name}”? Its past runs are kept.`)) return;
+    try {
+      await api(`/projects/${encodeURIComponent(slug)}/suites/${encodeURIComponent(suiteSlug)}`, { method: "DELETE" });
+      toast("Suite deleted");
+      location.hash = base;
+    } catch (ex) {
+      toast(ex.message, true);
+    }
+  });
+  if (isNew) form.elements.name.focus();
+}
+
+// ── Discover / explore ───────────────────────────────────────────────
+
+const CHARTER_IDEAS = [
+  "Try to break the sign-up and login forms with unusual input",
+  "Create, edit, and delete items; look for data that doesn't save correctly",
+  "Use the app in a narrow mobile-sized window and look for layout problems",
+  "Look for dead links, missing images, and console errors across the main pages",
+];
+
+async function sessionView(slug, mode, alive) {
+  const project = await api(`/projects/${encodeURIComponent(slug)}`);
+  if (!alive()) return;
+  const base = `#/projects/${encodeURIComponent(slug)}`;
+  const discover = mode === "discover";
+  const roles = Object.keys(project.credentials);
+
+  view.innerHTML = `
+    <a class="crumb" href="${base}">← ${esc(project.name)}</a>
+    <div class="page-head"><div>
+      <h1>${discover ? "Discover tests" : "Explore for bugs"}</h1>
+      <p class="sub">${discover
+        ? "An agent explores the app like a new user, maps its pages and flows, and proposes test cases. You choose which to keep."
+        : "An agent pokes at the app like a skeptical human tester, without a script, and reports the bugs it finds. Each bug can become a regression test."}</p>
+    </div></div>
+    <form class="form" id="session-form" novalidate>
+      ${discover ? `
+        <label class="field"><span>Focus <span class="muted">(optional)</span></span>
+          <textarea name="brief" rows="3" placeholder="e.g. The promotions area: creating, editing, and scheduling promotions"></textarea>
+          <span class="hint">Leave empty to map the whole app.</span></label>`
+      : `
+        <label class="field"><span>Charter</span>
+          <textarea name="brief" rows="3" required placeholder="What should the tester explore, and what should it look for?"></textarea>
+          <div class="chips">${CHARTER_IDEAS.map((idea) => `<button type="button" class="chip" data-idea="${esc(idea)}">${esc(idea)}</button>`).join("")}</div>
+        </label>`}
+      <div class="form-row">
+        <label class="field"><span>Start at</span>
+          <input name="url" type="url" placeholder="${esc(project.url || "https://staging.example.com")}" autocomplete="off">
+          <span class="hint">${project.url ? "Leave empty to use the project's URL." : "This project has no default URL."}</span></label>
+        <label class="field"><span>Cost limit (USD)</span>
+          <input name="max_cost" type="number" min="0.1" max="100" step="0.5" value="${DEFAULTS[mode]}">
+          <span class="hint">Estimated at API prices. The agent stops when it reaches this.</span></label>
+      </div>
+      <div class="notice">
+        <b>Safety rules the agent always follows:</b> it stays on ${esc(project.url ? new URL(project.url).host : "the app's domain")}, never deletes data,
+        pays, or messages real people, and names anything it creates “argus-test …”. ${roles.length
+          ? `It logs in as ${roles.map((r) => `<code>${esc(r)}</code>`).join(", ")} when needed.`
+          : `This project has no test accounts, so it can only see public pages. <a href="${base}?tab=settings">Add one</a>.`}
+        Use a staging environment.
+      </div>
+      <p class="form-error" id="form-error" hidden></p>
+      <div class="form-actions">
+        <button class="btn btn-primary" type="submit" id="submit-btn">${discover ? "Start discovery" : "Start exploring"}</button>
+        <a class="btn btn-ghost" href="${base}">Cancel</a>
+      </div>
+    </form>`;
+
+  const form = view.querySelector("#session-form");
+  form.addEventListener("click", (e) => {
+    const idea = e.target.closest("[data-idea]")?.dataset.idea;
+    if (idea) { form.elements.brief.value = idea; form.elements.brief.focus(); }
+  });
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const err = view.querySelector("#form-error");
+    err.hidden = true;
+    const f = form.elements;
+    const body = { [discover ? "focus" : "charter"]: f.brief.value.trim() };
+    if (f.url.value.trim()) body.url = f.url.value.trim();
+    if (Number(f.max_cost.value)) body.max_cost_usd = Number(f.max_cost.value);
+    const btn = view.querySelector("#submit-btn");
+    btn.disabled = true;
+    try {
+      const run = await api(`/projects/${encodeURIComponent(slug)}/${mode}`, { method: "POST", body });
+      location.hash = `#/runs/${run.id}`;
+    } catch (ex) {
+      err.textContent = ex.message;
+      err.hidden = false;
+      btn.disabled = false;
+    }
+  });
+  form.elements.brief.focus();
 }
 
 // ── Boot ─────────────────────────────────────────────────────────────
@@ -1002,6 +1469,7 @@ async function projectView(slug, alive) {
 (async () => {
   try {
     const health = await fetch("/health").then((r) => r.json());
+    Object.assign(DEFAULTS, health.default_max_cost_usd || {});
     if (health.auth_required && !getKey()) askForKey();
   } catch { /* server unreachable; views will show the error */ }
   route();

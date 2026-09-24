@@ -148,3 +148,24 @@ def plan_from_scenario(scenario: str, url: str, name: str = "Scenario") -> TestP
         f"{scenario.strip()}\n"
     )
     return parse_test_plan(text)
+
+
+def renumber(case: TestCase, new_id: str) -> TestCase:
+    """A copy of the case with a new ID, including in its heading."""
+    body = _TC_HEADER.sub(lambda m: f"### {new_id}: {m.group(2).strip()}", case.raw_markdown, count=1)
+    return TestCase(new_id, case.name, body, priority=case.priority, category=case.category)
+
+
+def compose_plan(title: str, url: str | None, cases: list[TestCase]) -> str:
+    """Markdown for a plan made of the given cases, numbered TC-001 onwards."""
+    head = f"# Test Plan: {title}\n\n" + (f"> URL: {url}\n\n" if url else "") + "## Test Cases\n"
+    body = [renumber(c, f"TC-{i:03d}").raw_markdown.strip() for i, c in enumerate(cases, start=1)]
+    return head + "".join(f"\n{b}\n\n---\n" for b in body)
+
+
+def append_cases(plan_text: str, cases: list[TestCase]) -> str:
+    """Append cases to an existing plan, numbering them after its highest TC ID."""
+    existing = parse_test_plan(plan_text).cases
+    next_num = max((int(c.id.split("-")[1]) for c in existing), default=0) + 1
+    added = [renumber(c, f"TC-{next_num + i:03d}").raw_markdown.strip() for i, c in enumerate(cases)]
+    return plan_text.rstrip() + "\n" + "".join(f"\n{b}\n\n---\n" for b in added)

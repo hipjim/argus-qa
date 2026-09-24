@@ -73,3 +73,34 @@ def test_plan_from_scenario():
     assert plan.cases[0].id == "TC-001"
     assert plan.cases[0].name == "Home"
     assert "Open the home page" in plan.cases[0].raw_markdown
+
+
+def test_compose_and_append_cases_renumber():
+    from argus_qa.plan_parser import append_cases, compose_plan
+
+    source = parse_test_plan("### TC-007: A\n\nsteps a\n\n### TC-009: B\n\nsteps b\n").cases
+    plan = compose_plan("Smoke", "https://x.test", source)
+    parsed = parse_test_plan(plan)
+    assert parsed.url == "https://x.test"
+    assert [(c.id, c.name) for c in parsed.cases] == [("TC-001", "A"), ("TC-002", "B")]
+    assert "steps b" in parsed.cases[1].raw_markdown
+
+    grown = parse_test_plan(append_cases(plan, source[:1]))
+    assert [(c.id, c.name) for c in grown.cases] == [("TC-001", "A"), ("TC-002", "B"), ("TC-003", "A")]
+
+
+def test_bugs_to_cases():
+    from argus_qa.results import bugs_to_cases
+
+    cases = bugs_to_cases([
+        {"title": "Save does nothing", "severity": "critical", "steps_to_reproduce": ["Open", "Save"],
+         "expected": "Saved", "actual": "Nothing"},
+        {"title": "Typo", "url": "/about"},
+        "not a bug object",
+    ])
+    assert [(c.id, c.name, c.priority) for c in cases] == [
+        ("TC-001", "Save does nothing", "critical"), ("TC-002", "Typo", "medium"),
+    ]
+    assert "1. Open\n2. Save" in cases[0].raw_markdown
+    assert "When found, the app did this instead: Nothing" in cases[0].raw_markdown
+    assert "1. Go to /about" in cases[1].raw_markdown

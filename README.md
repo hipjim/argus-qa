@@ -68,6 +68,10 @@ An AI agent opens a browser, logs in, navigates every page, maps forms and flows
 | `-u, --username` | Username to log in during exploration |
 | `-p, --password` | Password to log in during exploration |
 | `-o, --output` | Output path (default: `testplan.md`) |
+| `--focus` | What to concentrate on, e.g. `"the checkout flow"` (default: the whole app) |
+| `--max-cost USD` | Stop once the estimated cost reaches this |
+
+The explorer follows fixed safety rules: it stays on the app's domain, never deletes data, pays, or messages real people, and names anything it creates `argus-test …`. Still, point it at a staging environment.
 
 ```bash
 # Public site (no login)
@@ -173,8 +177,10 @@ curl -X POST localhost:8080/runs -H 'content-type: application/json' -d '{
 # Or a whole plan (only/skip/parallel work too)
 jq -Rs '{plan: ., only: ["TC-001", "TC-002"]}' testplan.md | curl -X POST localhost:8080/runs -H 'content-type: application/json' -d @-
 
-curl localhost:8080/runs/992a81d740eb          # status: queued | running | passed | failed | error | cancelled
+curl localhost:8080/runs/992a81d740eb          # status: queued | running | passed | failed | completed | error | cancelled
 ```
+
+Every run has a **cost limit**, estimated at Anthropic API prices. Agents stop when they reach it, and tests they didn't finish are marked blocked. Pass `max_cost_usd` per run, or set the server defaults with `ARGUS_MAX_RUN_COST` (default $5), `ARGUS_MAX_DISCOVER_COST` ($3) and `ARGUS_MAX_EXPLORE_COST` ($2). With a Claude subscription login rather than an API key, usage counts against your plan instead of being billed, and the cost is only an estimate.
 
 | Endpoint | Description |
 |----------|-------------|
@@ -189,7 +195,10 @@ curl localhost:8080/runs/992a81d740eb          # status: queued | running | pass
 | `GET /runs/{id}/report` | Markdown quality report |
 | `GET /runs/{id}/junit` | JUnit XML |
 | `GET /runs/{id}/screenshots` | Screenshot filenames; fetch one with `/screenshots/{name}` |
-| `GET /health` | Liveness and number of active runs |
+| `GET /runs/{id}/proposed` | Test cases proposed by a discover or explore run |
+| `POST /runs/{id}/accept` | Save proposed tests to a suite: `{"case_ids": [...], "suite": "smoke"}` or `{"suite_name": "New suite"}` |
+| `GET /runs/{id}/exploration` | What a discover run mapped: pages, user flows, forms, issues noticed |
+| `GET /health` | Liveness, whether an API key is required, and the default cost limits |
 
 If `callback_url` is set, the run record is POSTed there when the run finishes.
 
@@ -257,6 +266,23 @@ curl -X POST localhost:8080/runs -H 'content-type: application/json' -d '{
 - The URL is taken from `--url`/`url` in the request first, then the project, then the plan's `> URL:` line.
 - Passwords and `secrets` are given to the tester agent only. They are masked in API responses and replaced with `[redacted]` in results, reports, JUnit output, and logs; the report-writing agent never sees them.
 - On the server, `${VAR}` references resolve against the server's environment, and project files are stored readable only by the server's user.
+
+## Discover, explore, and saved suites
+
+A project can hold **test suites**: saved plans you run with one click (`POST /projects/{slug}/suites/{suite}/run`). You can write them yourself, but the quickest way to get one is to let argus-qa find the tests:
+
+- **Discover** (`POST /projects/{slug}/discover`, optional `focus`): an agent explores the app like a new user, logs in with the project's accounts, maps its pages and flows, and proposes test cases. It knows your existing suites and avoids duplicates.
+- **Explore** (`POST /projects/{slug}/explore` with a `charter`): an agent hunts for bugs without a script, trying unusual input, double submits, refreshes mid-flow, and narrow windows. It reproduces each bug before reporting it, with steps and screenshots. **Each bug becomes a proposed regression test.**
+
+In the web UI you review the proposals, untick the ones you don't want, and save the rest to a new or existing suite. New tests are numbered after the suite's existing ones. Both kinds of session follow the safety rules above and have their own cost limits.
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET/POST /projects/{slug}/suites` | List or create suites (`{"name": ..., "plan": "### TC-001: ..."}`) |
+| `GET/PUT/DELETE /projects/{slug}/suites/{suite}` | Read, replace, or delete a suite |
+| `POST /projects/{slug}/suites/{suite}/run` | Run a suite (`only`, `parallel`, `url`, `max_cost_usd` optional) |
+| `POST /projects/{slug}/discover` | Start a discovery session |
+| `POST /projects/{slug}/explore` | Start an exploratory bug hunt |
 
 ## The test plan format
 

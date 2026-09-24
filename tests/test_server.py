@@ -330,7 +330,9 @@ async def test_ui_and_health_are_public_but_data_needs_key(make_client, monkeypa
         assert "argus" in page.text
         assert (await client.get("/static/app.js")).status_code == 200
         assert (await client.get("/static/vendor/purify.min.js")).status_code == 200
-        assert (await client.get("/health")).json() == {"status": "ok", "auth_required": True}
+        health = (await client.get("/health")).json()
+        assert health["auth_required"] is True
+        assert health["default_max_cost_usd"] == {"test": 5.0, "discover": 3.0, "explore": 2.0}
         assert (await client.get("/runs")).status_code == 401
         assert (await client.get("/projects")).status_code == 401
 

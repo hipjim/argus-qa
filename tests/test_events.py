@@ -44,3 +44,20 @@ def test_describe_screenshot_carries_file():
 
 def test_describe_unknown_tool():
     assert describe_tool("mcp__other__sync_data", {}) == ("sync_data", "Sync data", {})
+
+
+def test_prose_strips_json_report():
+    from argus_qa.agents.orchestrator import _prose
+
+    assert _prose('The test passed.\n\n```json\n{"a": 1}\n```') == "The test passed."
+    assert _prose('```json\n{"summary": "x"}\n```') == ""
+    assert _prose('{"summary": "x"}') == ""
+    assert _prose("Now logging in as member.") == "Now logging in as member."
+
+
+def test_shorten_titles():
+    from argus_qa.server import _shorten
+
+    assert _shorten("Explore: short", 90) == "Explore: short"
+    long = "Explore: Try to break the login form with unusual input: empty fields, very long values, special characters"
+    assert _shorten(long, 60) == "Explore: Try to break the login form with unusual input…"

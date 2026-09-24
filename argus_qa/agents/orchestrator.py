@@ -27,14 +27,23 @@ from claude_agent_sdk import (
 
 from argus_qa import colors as c
 from argus_qa.events import describe_tool, emit
-from argus_qa.plan_parser import TestPlan, parse_test_plan
+from argus_qa.plan_parser import TestCase, TestPlan, compose_plan, parse_test_plan
 from argus_qa.project import Project, Redactor, substitute
+from argus_qa.prompts.bug_hunter import BUG_HUNTER_PROMPT
 from argus_qa.prompts.explorer import EXPLORER_PROMPT
+from argus_qa.prompts.guardrails import GUARDRAILS
 from argus_qa.prompts.reporter import REPORTER_PROMPT
 from argus_qa.prompts.scaffold import SCAFFOLD_PROMPT
 from argus_qa.prompts.tester import TESTER_PROMPT
+from argus_qa.results import (
+    bugs_to_cases,
+    discovery_report,
+    exploration_report,
+    extract_json,
+    merge_results,
+    to_junit,
+)
 from argus_qa.results import failed_ids as _failed_ids
-from argus_qa.results import merge_results, to_junit
 
 AGENT_NAMES = [
     "Chad the Clicker",
@@ -57,6 +66,17 @@ AGENT_NAMES = [
 
 # Pinned so upstream releases can't silently change browser behaviour between runs
 PLAYWRIGHT_MCP_PACKAGE = "@playwright/mcp@0.0.82"
+
+# Turn limits per agent, so a confused agent can't loop forever
+TESTER_MAX_TURNS = 300
+EXPLORER_MAX_TURNS = 150
+REPORTER_MAX_TURNS = 5
+
+# Why an agent stopped early, in words (ResultMessage.subtype -> message)
+_STOP_REASONS = {
+    "error_max_turns": "reached its turn limit",
+    "error_max_budget_usd": "reached its cost limit",
+}
 
 
 def install_browser() -> None:
@@ -103,6 +123,8 @@ def _browser_options(
     headless: bool = False,
     isolated: bool = False,
     output_dir: Path | None = None,
+    max_budget_usd: float | None = None,
+    max_turns: int | None = TESTER_MAX_TURNS,
 ) -> ClaudeAgentOptions:
     """Options for agents that need browser access.
 
@@ -115,12 +137,20 @@ def _browser_options(
         tools=[],
         allowed_tools=["mcp__playwright__*"],
         cwd=str(output_dir.resolve()) if output_dir is not None else None,
+        max_budget_usd=max_budget_usd,
+        max_turns=max_turns,
     )
 
 
-def _reasoning_options() -> ClaudeAgentOptions:
+def _reasoning_options(max_budget_usd: float | None = None) -> ClaudeAgentOptions:
     """Options for agents that only need to think and write."""
-    return ClaudeAgentOptions(tools=[], allowed_tools=[])
+    return ClaudeAgentOptions(
+        tools=[], allowed_tools=[], max_budget_usd=max_budget_usd, max_turns=REPORTER_MAX_TURNS
+    )
+
+
+def _share(budget: float | None, fraction: float) -> float | None:
+    return round(budget * fraction, 4) if budget else None
 
 
 @dataclass
@@ -146,7 +176,9 @@ async def _run_agent(
                 if isinstance(block, TextBlock):
                     line = redact(block.text.strip().replace("\n", " "))
                     if line:
-                        emit("say", redact(block.text.strip()), agent=label)
+                        spoken = _prose(redact(block.text.strip()))
+                        if spoken:
+                            emit("say", spoken, agent=label)
                         # Highlight keywords in the output
                         line = _colorize_line(line)
                         if label:
@@ -163,10 +195,20 @@ async def _run_agent(
                 run.ok = True
                 run.text = redact(message.result or "")
             else:
-                print(c.error(f"  Agent error: {message.subtype}"))
-                emit("error", f"Agent stopped: {message.subtype}", agent=label)
+                reason = _STOP_REASONS.get(message.subtype, message.subtype)
+                print(c.error(f"  Agent stopped: {reason}"))
+                emit("error", f"Stopped early: {reason}", agent=label)
                 run.text = f"Agent error: {message.subtype}"
     return run
+
+
+def _prose(text: str) -> str:
+    """The narration part of an agent message, without the JSON report it may end with."""
+    for marker in ("```json", "```\n{", "\n{"):
+        if marker in text:
+            text = text.split(marker, 1)[0]
+    text = text.strip()
+    return "" if text.startswith("{") else text
 
 
 _STATUS_WORDS = [
@@ -197,78 +239,217 @@ async def run_analyze(
     credentials: dict[str, str] | None = None,
     headless: bool = False,
     project: Project | None = None,
+    focus: str = "",
+    max_cost_usd: float | None = None,
+    output_dir: str = "reports",
 ) -> str:
-    """Explore a website and generate a test plan scaffold."""
+    """Explore a website and write a test plan scaffold (CLI)."""
     url = url or (project.url if project else None)
     if not url:
         raise ValueError("No URL: pass one, or set `url` in the project.")
     output = Path(output_file or "testplan.md")
-    timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+    stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    run_dir = Path(output_dir) / site_dir_name(url) / f"{stamp}_discover"
 
-    secrets = project.secret_values() if project else []
-    project_guidance = ""
+    result = await discover_app(
+        url, run_dir, project=project, credentials=credentials, focus=focus,
+        headless=headless, max_cost_usd=max_cost_usd,
+    )
+    if result.environment_error:
+        raise RuntimeError(
+            f"The browser couldn't explore the app: {result.environment_error}\n"
+            "  If the browser isn't installed, run: argus-qa setup"
+        )
+    output.write_text(result.raw_plan)
+    print(c.success(f"\n  Test plan saved to {output}\n"))
+    print(c.dim(f"  Exploration notes: {run_dir}   Cost: ${result.cost_usd:.2f}"))
+    return str(output)
+
+
+# ── Discovery & exploration sessions ────────────────────────────────
+
+
+@dataclass
+class SessionResult:
+    """Outcome of a discover or explore session."""
+
+    run_dir: Path
+    summary: dict
+    proposed: list[TestCase]
+    cost_usd: float = 0.0
+    environment_error: str | None = None
+    raw_plan: str = ""
+
+
+def _login_text(project: Project | None, credentials: dict[str, str] | None) -> str:
     if project:
-        creds_text = project.prompt_section()
+        text = project.prompt_section()
         if project.credentials:
-            creds_text += "\nLog in with the test accounts above to explore authenticated areas."
-            roles = ", ".join(project.credentials)
-            project_guidance = (
-                f"Test accounts are configured in the project (roles: {roles}). Do NOT include a "
-                "Credentials section or any usernames/passwords in the plan. Write login steps as "
-                "'Log in as <role>'.\n"
-            )
-    elif credentials:
-        secrets.append(credentials["password"])
-        creds_text = (
-            f"Use these to log in:\n"
-            f"- Username: `{credentials['username']}`\n"
+            text += "\nLog in with the test accounts above to explore authenticated areas."
+        return text
+    if credentials:
+        return (
+            f"Use these to log in:\n- Username: `{credentials['username']}`\n"
             f"- Password: `{credentials['password']}`"
         )
-    else:
-        creds_text = "No credentials provided. Explore only public/unauthenticated areas."
+    return "No credentials provided. Explore only public/unauthenticated areas."
+
+
+def _guardrails(url: str) -> str:
+    return GUARDRAILS.format(host=urlparse(url).hostname or url)
+
+
+def _parse_json(text: str) -> dict | None:
+    try:
+        data = json.loads(extract_json(text))
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+async def discover_app(
+    url: str,
+    run_dir: Path,
+    project: Project | None = None,
+    credentials: dict[str, str] | None = None,
+    focus: str = "",
+    existing_tests: list[str] | None = None,
+    headless: bool = False,
+    isolated: bool = False,
+    max_cost_usd: float | None = None,
+) -> SessionResult:
+    """Explore an app and propose test cases. Writes exploration.json, proposed.md, report.md."""
+    ss_dir = run_dir / "screenshots"
+    ss_dir.mkdir(parents=True, exist_ok=True)
+    secrets = project.secret_values() if project else []
+    if credentials and credentials.get("password"):
+        secrets.append(credentials["password"])
     redact = Redactor(secrets)
 
-    # Phase 1: Explore
     explorer_name = _pick_agent_name()
     print(c.phase(1, 2, f"{explorer_name} is exploring the application..."))
     emit("phase", f"{explorer_name} is exploring the application")
     exploration = await _run_agent(
-        prompt=EXPLORER_PROMPT.format(url=url, credentials=creds_text),
-        options=_browser_options(headless=headless),
+        prompt=EXPLORER_PROMPT.format(
+            url=url,
+            credentials=_login_text(project, credentials),
+            focus=focus.strip() or "The whole application: its main pages, features, and user flows.",
+            guardrails=_guardrails(url),
+        ),
+        options=_browser_options(
+            headless=headless, isolated=isolated, output_dir=ss_dir,
+            max_budget_usd=_share(max_cost_usd, 0.8), max_turns=EXPLORER_MAX_TURNS,
+        ),
         label=explorer_name,
         redact=redact,
     )
+    _redact_text_files(ss_dir, redact)
     if not exploration.ok:
         raise RuntimeError(f"Exploration failed: {exploration.text}")
+    data = _parse_json(exploration.text)
+    (run_dir / "exploration.json").write_text(json.dumps(data or {"raw": exploration.text}, indent=2))
+    if data and data.get("environment_error"):
+        emit("error", f"The browser couldn't explore the app: {data['environment_error']}")
+        return SessionResult(run_dir, {}, [], exploration.cost_usd, str(data["environment_error"]))
     print(c.success("\n  Exploration complete.\n"))
 
-    # Phase 2: Generate scaffold
-    print(c.phase(2, 2, "Generating test plan scaffold..."))
-    emit("phase", "Writing the test plan")
+    guidance = ""
+    if project and project.credentials:
+        roles = ", ".join(project.credentials)
+        guidance += (
+            f"Test accounts are configured in the project (roles: {roles}). Do NOT include a "
+            "Credentials section or any usernames/passwords in the plan. Write login steps as "
+            "'Log in as <role>'.\n"
+        )
+    if existing_tests:
+        guidance += (
+            "These tests already exist; don't propose duplicates of them:\n"
+            + "".join(f"- {t}\n" for t in existing_tests)
+        )
+    if focus.strip():
+        guidance += f"Concentrate the test cases on this focus: {focus.strip()}\n"
+
+    print(c.phase(2, 2, "Proposing test cases..."))
+    emit("phase", "Writing test cases from what was found")
     scaffold = await _run_agent(
         prompt=SCAFFOLD_PROMPT.format(
             url=url,
-            timestamp=timestamp,
+            timestamp=datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
             exploration_report=exploration.text,
-            project_guidance=project_guidance,
+            project_guidance=guidance,
         ),
-        options=_reasoning_options(),
+        options=_reasoning_options(max_budget_usd=_share(max_cost_usd, 0.2)),
         label="scaffold",
         redact=redact,
     )
+    cost = exploration.cost_usd + scaffold.cost_usd
     if not scaffold.ok:
         raise RuntimeError(f"Test plan generation failed: {scaffold.text}")
-    if not parse_test_plan(scaffold.text).cases:
-        rejected = output.with_suffix(".rejected.md")
-        rejected.write_text(scaffold.text)
-        raise RuntimeError(
-            f"Generated test plan contains no '### TC-NNN:' test cases. Raw output saved to {rejected}"
-        )
+    cases = parse_test_plan(scaffold.text).cases
+    if not cases:
+        (run_dir / "proposed.rejected.md").write_text(scaffold.text)
+        raise RuntimeError("The proposed plan contains no '### TC-NNN:' test cases.")
 
-    output.write_text(scaffold.text)
-    print(c.success(f"\n  Test plan saved to {output}\n"))
-    print(c.dim(f"  Cost: ${exploration.cost_usd + scaffold.cost_usd:.2f}"))
-    return str(output)
+    title = (data or {}).get("title") or (project.name if project else urlparse(url).hostname or url)
+    (run_dir / "proposed.md").write_text(compose_plan(str(title), url, cases))
+    (run_dir / "report.md").write_text(discovery_report(data, cases, url))
+    summary = {
+        "proposed": len(cases),
+        "pages": len((data or {}).get("pages") or []),
+        "flows": len((data or {}).get("user_flows") or []),
+    }
+    emit("phase", f"Proposed {len(cases)} test cases")
+    return SessionResult(run_dir, summary, cases, cost, raw_plan=scaffold.text)
+
+
+async def explore_app(
+    url: str,
+    run_dir: Path,
+    charter: str,
+    project: Project | None = None,
+    headless: bool = False,
+    isolated: bool = False,
+    max_cost_usd: float | None = None,
+) -> SessionResult:
+    """Hunt for bugs without a script. Writes results.json, proposed.md (regression tests), report.md."""
+    ss_dir = run_dir / "screenshots"
+    ss_dir.mkdir(parents=True, exist_ok=True)
+    redact = Redactor(project.secret_values() if project else [])
+
+    name = _pick_agent_name()
+    print(c.phase(1, 1, f"{name} is hunting for bugs..."))
+    emit("phase", f"{name} is hunting for bugs")
+    run = await _run_agent(
+        prompt=BUG_HUNTER_PROMPT.format(
+            url=url,
+            project_context=project.prompt_section() if project else "",
+            charter=charter.strip(),
+            guardrails=_guardrails(url),
+        ),
+        options=_browser_options(
+            headless=headless, isolated=isolated, output_dir=ss_dir,
+            max_budget_usd=max_cost_usd, max_turns=EXPLORER_MAX_TURNS,
+        ),
+        label=name,
+        redact=redact,
+    )
+    _redact_text_files(ss_dir, redact)
+    data = _parse_json(run.text) if run.ok else None
+    if data is None:
+        raise RuntimeError(f"The exploratory session produced no report: {run.text[:300]}")
+    if data.get("environment_error"):
+        emit("error", f"The browser couldn't explore the app: {data['environment_error']}")
+        return SessionResult(run_dir, {}, [], run.cost_usd, str(data["environment_error"]))
+
+    bugs = [b for b in data.get("bugs") or [] if isinstance(b, dict)]
+    cases = bugs_to_cases(bugs)
+    (run_dir / "results.json").write_text(json.dumps(data, indent=2))
+    (run_dir / "report.md").write_text(exploration_report(data, url))
+    if cases:
+        (run_dir / "proposed.md").write_text(compose_plan("Regression tests from exploration", url, cases))
+    summary = {"bugs": len(bugs), "proposed": len(cases)}
+    emit("phase", f"Found {len(bugs)} bug{'s' if len(bugs) != 1 else ''}")
+    return SessionResult(run_dir, summary, cases, run.cost_usd)
 
 
 # ── Test mode ───────────────────────────────────────────────────────
@@ -308,6 +489,7 @@ async def run_tests(
     headless: bool = False,
     junit_file: str | None = None,
     project: Project | None = None,
+    max_cost_usd: float | None = None,
 ) -> RunResult:
     """Execute a test plan from a Markdown file.
 
@@ -322,6 +504,7 @@ async def run_tests(
         headless: Run the browser headless (parallel runs are always headless).
         junit_file: Extra path to write JUnit XML to, in addition to the run dir.
         project: Project supplying the URL, test accounts, data, and instructions.
+        max_cost_usd: Stop agents once the run's estimated cost reaches this.
     """
     plan_path = Path(test_plan_file)
     if not plan_path.exists():
@@ -357,6 +540,7 @@ async def run_tests(
         headless=headless,
         screenshot_dir=Path(screenshot_dir) if screenshot_dir else None,
         project=project,
+        max_cost_usd=max_cost_usd,
     )
     if result.environment_error:
         raise RuntimeError(
@@ -384,12 +568,14 @@ async def execute_plan(
     screenshot_dir: Path | None = None,
     isolated: bool = False,
     project: Project | None = None,
+    max_cost_usd: float | None = None,
 ) -> RunResult:
     """Run the given test cases, write results/report/JUnit to run_dir, and return the outcome.
 
     Set isolated when other runs may be using a browser at the same time. The
     project's secrets are given to tester agents but redacted from everything
-    printed or saved, and never shown to the reporter.
+    printed or saved, and never shown to the reporter. max_cost_usd is split between the
+    tester agents (90%) and the reporter (10%).
     """
     substitute(plan.to_markdown(), project)  # fail fast on unknown {{placeholders}}
     redact = Redactor(project.secret_values() if project else [])
@@ -419,7 +605,7 @@ async def execute_plan(
         emit("phase", f"{tester_name} is running {total} test{'s' if total != 1 else ''}")
         runs = [await _run_test_chunk(
             url, plan, ss_dir, label=tester_name, headless=headless, isolated=isolated,
-            project=project, redact=redact,
+            project=project, redact=redact, max_budget_usd=_share(max_cost_usd, 0.9),
         )]
     else:
         chunks = plan.split_chunks(min(parallel, total))
@@ -435,7 +621,7 @@ async def execute_plan(
             tasks.append(
                 _run_test_chunk(
                     url, chunk, ss_dir, label=name, headless=True, isolated=True,
-                    project=project, redact=redact,
+                    project=project, redact=redact, max_budget_usd=_share(max_cost_usd, 0.9 / len(chunks)),
                 )
             )
         print()
@@ -478,7 +664,7 @@ async def execute_plan(
             test_results=json.dumps(merged_results, indent=2),
             screenshot_dir=str(ss_dir),
         ),
-        options=_reasoning_options(),
+        options=_reasoning_options(max_budget_usd=_share(max_cost_usd, 0.1)),
         label="reporter",
         redact=redact,
     )
@@ -529,6 +715,7 @@ async def _run_test_chunk(
     isolated: bool = False,
     project: Project | None = None,
     redact: Redactor | None = None,
+    max_budget_usd: float | None = None,
 ) -> AgentRun:
     """Run a chunk of test cases in one agent.
 
@@ -541,7 +728,9 @@ async def _run_test_chunk(
         screenshot_dir=str(screenshot_dir),
         project_context=project.prompt_section() if project else "",
     )
-    options = _browser_options(headless=headless, isolated=isolated, output_dir=screenshot_dir)
+    options = _browser_options(
+        headless=headless, isolated=isolated, output_dir=screenshot_dir, max_budget_usd=max_budget_usd
+    )
     return await _run_agent(prompt, options, label=label, redact=redact)
 
 
@@ -557,6 +746,7 @@ async def run_watch(
     screenshot_dir: str | None = None,
     headless: bool = False,
     project: Project | None = None,
+    max_cost_usd: float | None = None,
 ) -> None:
     """Watch mode: re-run failed tests when the app changes.
 
@@ -579,6 +769,7 @@ async def run_watch(
     result = await run_tests(
         test_plan_file, url=target_url, output_dir=output_dir,
         parallel=parallel, screenshot_dir=screenshot_dir, headless=headless, project=project,
+        max_cost_usd=max_cost_usd,
     )
     failed_ids = result.failed_ids
     last_hash = await _fetch_hash(target_url)
@@ -607,7 +798,7 @@ async def run_watch(
         result = await run_tests(
             test_plan_file, url=target_url, output_dir=output_dir,
             only=run_only, parallel=parallel, screenshot_dir=screenshot_dir, headless=headless,
-            project=project,
+            project=project, max_cost_usd=max_cost_usd,
         )
         failed_ids = result.failed_ids
 
