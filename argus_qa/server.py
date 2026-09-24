@@ -114,7 +114,7 @@ class RunRequest(BaseModel):
 
     project: str | None = Field(None, description="Project slug supplying URL, accounts, and test data.")
     plan: str | None = Field(None, description="Full Markdown test plan (### TC-NNN: sections).")
-    scenario: str | None = Field(None, description="Plain-English steps and expected result for one test.")
+    scenario: str | None = Field(None, description="A quick test: plain-English steps and expected result.")
     name: str | None = Field(None, description="Name for the scenario (used with `scenario`).")
     url: HttpUrl | None = Field(None, description="Target URL. Overrides the project's and plan's URL.")
     only: list[str] | None = Field(None, description="Run only these test case IDs.")
@@ -564,7 +564,7 @@ def _build_plan(req: RunRequest, url: str | None) -> TestPlan:
     if req.scenario:
         if not url:
             raise HTTPException(422, "No URL: pass `url` or use a project that has one.")
-        plan = plan_from_scenario(req.scenario, url, name=req.name or "Scenario")
+        plan = plan_from_scenario(req.scenario, url, name=req.name or "Quick test")
     else:
         plan = parse_test_plan(req.plan or "")
         if not plan.cases:

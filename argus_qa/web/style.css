@@ -917,6 +917,13 @@ legend { padding: 0; margin-bottom: 4px; font-weight: 600; }
 .tc-add-case { justify-self: start; }
 
 .suite-toolbar { display: flex; align-items: center; gap: 14px; }
+.suite-toolbar .spacer { flex: 1; }
+.suite-toolbar label.btn { cursor: pointer; }
+.suite-picks { border: 1px solid var(--rule); border-radius: var(--radius); padding: 10px 14px; background: var(--paper-raised); }
+.suite-picks legend { padding: 0 4px; color: var(--ink-2); font-weight: 500; }
+#suite-tests { display: grid; gap: 4px; margin-top: 4px; max-height: 280px; overflow-y: auto; }
+.suite-test { display: flex; align-items: baseline; gap: 8px; font-size: 14px; cursor: pointer; }
+.suite-test input, .suite-picks .select-all input { width: auto; margin: 0; accent-color: var(--accent); }
 .values-bar { gap: 6px; }
 .plan-notes summary { font-size: 13px; font-weight: 500; color: var(--ink-2); cursor: pointer; }
 .plan-notes textarea { margin-top: 8px; min-height: 80px; }

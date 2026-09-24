@@ -632,6 +632,7 @@ function caseEditor(container, initial, { single = false, project = null, placeh
 
   draw();
   return {
+    replace: (next) => { cases = next.length ? next.map((c) => ({ ...emptyCase(), ...c })) : [emptyCase()]; draw(); },
     cases: () => cases.map((c) => ({ ...c, preconditions: c.preconditions.filter((v) => v.trim()),
       steps: c.steps.filter((v) => v.trim()), expected: c.expected.filter((v) => v.trim()) })),
   };
@@ -671,7 +672,7 @@ async function newRunView(params, alive) {
     <a class="crumb" href="#/runs">← Runs</a>
     <div class="page-head"><div>
       <h1>New run</h1>
-      <p class="sub">Describe one scenario in plain English, or paste a full test plan.</p>
+      <p class="sub">Run a quick one-off test, or one of a project's saved suites.</p>
     </div></div>
     <form class="form" id="run-form" novalidate>
       <div class="form-row">
@@ -691,29 +692,22 @@ async function newRunView(params, alive) {
       <div class="field">
         <span>What to test</span>
         <div class="segmented" role="group" aria-label="Input type">
-          <button type="button" data-mode="scenario" aria-pressed="true">Scenario</button>
-          <button type="button" data-mode="plan" aria-pressed="false">Test plan</button>
-          <button type="button" data-mode="suite" aria-pressed="false" id="suite-mode-btn" hidden>Saved suite</button>
+          <button type="button" data-mode="quick" aria-pressed="true">Quick test</button>
+          <button type="button" data-mode="suite" aria-pressed="false" id="suite-mode-btn" hidden>Suite</button>
         </div>
+        <span class="hint" id="mode-hint">One test, run now. It isn't saved, apart from the run's results.</span>
       </div>
 
-      <div id="mode-scenario" class="tc-editor"></div>
+      <div id="mode-quick" class="tc-editor"></div>
 
-      <div id="mode-plan" class="form" style="gap:16px" hidden>
-        <label class="field"><span>Test plan (Markdown)</span>
-          <textarea name="plan" rows="16" placeholder="### TC-001: Login with valid credentials&#10;&#10;**Steps:**&#10;1. …"></textarea>
-          <span class="detected" id="detected"></span>
-        </label>
-        <div class="form-row">
-          <label class="field"><span>Load a file</span><input type="file" accept=".md,.markdown,.txt" id="plan-file"></label>
-          <label class="field"><span>Only these tests</span><input name="only" placeholder="TC-001, TC-004" autocomplete="off">
-            <span class="hint">Optional, comma-separated.</span></label>
-        </div>
-      </div>
-
-      <div id="mode-suite" class="form" style="gap:16px" hidden>
+      <div id="mode-suite" class="form" style="gap:14px" hidden>
         <label class="field"><span>Suite</span><select name="suite"></select>
           <span class="hint" id="suite-hint"></span></label>
+        <fieldset class="suite-picks">
+          <legend class="small">Tests to run</legend>
+          <label class="select-all"><input type="checkbox" id="suite-all" checked> All</label>
+          <div id="suite-tests"></div>
+        </fieldset>
       </div>
 
       <div class="field" id="placeholders" hidden>
@@ -741,14 +735,13 @@ async function newRunView(params, alive) {
 
   const form = view.querySelector("#run-form");
   const byName = Object.fromEntries(projects.map((p) => [p.slug, p]));
-  let mode = "scenario";
+  let mode = "quick";
   let lastFocused = null;
-  let scenario = null;
+  let quick = null;
 
-  form.elements.plan.addEventListener("focus", (e) => { lastFocused = e.target; });
-  const buildScenarioEditor = () => {
+  const buildQuickEditor = () => {
     const slug = form.elements.project.value || null;
-    scenario = caseEditor(view.querySelector("#mode-scenario"), scenario ? scenario.cases() : [], {
+    quick = caseEditor(view.querySelector("#mode-quick"), quick ? quick.cases() : [], {
       single: true, project: slug, placeholders: projectPlaceholders(byName[slug]),
       onFocus: (el) => { lastFocused = el; },
     });
@@ -758,11 +751,25 @@ async function newRunView(params, alive) {
   const setMode = (next) => {
     mode = next;
     view.querySelectorAll("[data-mode]").forEach((x) => x.setAttribute("aria-pressed", String(x.dataset.mode === mode)));
-    view.querySelector("#mode-scenario").hidden = mode !== "scenario";
-    view.querySelector("#mode-plan").hidden = mode !== "plan";
+    view.querySelector("#mode-quick").hidden = mode !== "quick";
     view.querySelector("#mode-suite").hidden = mode !== "suite";
     view.querySelector("#placeholders").classList.toggle("off", mode === "suite");
-    lastFocused = mode === "plan" ? form.elements.plan : null;
+    view.querySelector("#mode-hint").textContent = mode === "quick"
+      ? "One test, run now. It isn't saved, apart from the run's results."
+      : "A saved set of tests from this project.";
+    lastFocused = null;
+  };
+  const drawSuite = () => {
+    const suite = suites.find((st) => st.slug === form.elements.suite.value);
+    if (!suite) return;
+    const last = suite.last_run ? ` · last run ${suite.last_run.status} ${relTime(suite.last_run.created_at)}` : "";
+    view.querySelector("#suite-hint").innerHTML = `${suite.test_count} test${suite.test_count === 1 ? "" : "s"}${esc(last)} · `
+      + `<a href="#/projects/${esc(form.elements.project.value)}/suites/${esc(suite.slug)}">Edit suite</a>`;
+    view.querySelector("#suite-tests").innerHTML = suite.tests.map((t) => `
+      <label class="suite-test"><input type="checkbox" value="${esc(t.id)}" checked>
+        <span class="case-id">${esc(t.id)}</span> ${esc(t.name)}</label>`).join("");
+    view.querySelector("#suite-all").checked = true;
+    view.querySelector("#suite-all").indeterminate = false;
   };
   const syncSuites = async () => {
     const slug = form.elements.project.value;
@@ -775,9 +782,20 @@ async function newRunView(params, alive) {
       form.elements.suite.value = preferred;
       setMode("suite");
     } else if (mode === "suite" && !suites.length) {
-      setMode("scenario");
+      setMode("quick");
     }
+    drawSuite();
   };
+  form.elements.suite.addEventListener("change", drawSuite);
+  view.querySelector("#suite-all").addEventListener("change", (e) => {
+    view.querySelectorAll("#suite-tests input").forEach((b) => { b.checked = e.target.checked; });
+  });
+  view.querySelector("#suite-tests").addEventListener("change", () => {
+    const boxes = [...view.querySelectorAll("#suite-tests input")];
+    const n = boxes.filter((b) => b.checked).length;
+    view.querySelector("#suite-all").checked = n === boxes.length;
+    view.querySelector("#suite-all").indeterminate = n > 0 && n < boxes.length;
+  });
   const syncProject = () => {
     syncSuites();
     const p = byName[form.elements.project.value];
@@ -786,27 +804,12 @@ async function newRunView(params, alive) {
     const values = projectPlaceholders(p);
     view.querySelector("#placeholders").hidden = !values.length;
     placeholderChips(view.querySelector("#placeholder-chips"), values, () => lastFocused);
-    buildScenarioEditor();
+    buildQuickEditor();
   };
   form.elements.project.addEventListener("change", syncProject);
   syncProject();
 
   view.querySelectorAll("[data-mode]").forEach((b) => b.addEventListener("click", () => setMode(b.dataset.mode)));
-
-  const detect = () => {
-    const ids = [...form.elements.plan.value.matchAll(/^###\s+(TC-\d+)\s*:\s*(.+)$/gm)].map((m) => m[1]);
-    view.querySelector("#detected").innerHTML = form.elements.plan.value.trim()
-      ? (ids.length ? `<b>${ids.length}</b> test case${ids.length === 1 ? "" : "s"}: ${esc(ids.join(", "))}`
-        : "No test cases found. Each needs a heading like <b>### TC-001: Title</b>.")
-      : "";
-  };
-  form.elements.plan.addEventListener("input", detect);
-  view.querySelector("#plan-file").addEventListener("change", async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    form.elements.plan.value = await file.text();
-    detect();
-  });
 
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -822,14 +825,22 @@ async function newRunView(params, alive) {
     if (mode === "suite") {
       endpoint = `/projects/${encodeURIComponent(f.project.value)}/suites/${encodeURIComponent(f.suite.value)}/run`;
       delete body.project;
-    } else if (mode === "scenario") {
-      const [test] = scenario.cases();
+      const boxes = [...view.querySelectorAll("#suite-tests input")];
+      const picked = boxes.filter((b) => b.checked).map((b) => b.value);
+      if (!picked.length) {
+        err.textContent = "Pick at least one test to run.";
+        err.hidden = false;
+        return;
+      }
+      if (picked.length < boxes.length) body.only = picked;
+    } else {
+      const [test] = quick.cases();
       if (!test.steps.length) {
         err.textContent = "Add at least one step, or describe the test in a sentence and click “Draft steps”.";
         err.hidden = false;
         return;
       }
-      const title = test.title.trim() || "Scenario";
+      const title = test.title.trim() || "Quick test";
       try {
         body.plan = (await api("/plans/render", {
           method: "POST", body: { title, cases: [{ ...test, title }] },
@@ -839,10 +850,6 @@ async function newRunView(params, alive) {
         err.hidden = false;
         return;
       }
-    } else {
-      body.plan = f.plan.value;
-      const only = f.only.value.split(",").map((s) => s.trim()).filter(Boolean);
-      if (only.length) body.only = only;
     }
     const btn = view.querySelector("#submit-btn");
     btn.disabled = true;
@@ -857,7 +864,7 @@ async function newRunView(params, alive) {
       btn.textContent = "Start run";
     }
   });
-  view.querySelector(form.elements.project.value ? "#mode-scenario .tc-title" : 'input[name="url"]')?.focus();
+  view.querySelector(form.elements.project.value ? "#mode-quick .tc-title" : 'input[name="url"]')?.focus();
 }
 
 // ── Run detail ───────────────────────────────────────────────────────
@@ -1000,7 +1007,7 @@ async function runView(runId, alive) {
       ? [["proposed", "Proposed tests", nProposed], ["map", "App map"], ["report", "Report"], ["screenshots", "Screenshots", images]]
       : run.kind === "explore"
         ? [["bugs", "Bugs", run.summary?.bugs], ["proposed", "Regression tests", nProposed], ["report", "Report"], ["screenshots", "Screenshots", images]]
-        : [["tests", "Tests", run.test_ids.length], ["report", "Report"], ["screenshots", "Screenshots", images], ["plan", "Plan"]];
+        : [["tests", "Tests", run.test_ids.length], ["report", "Report"], ["screenshots", "Screenshots", images], ["plan", "Source"]];
     $("#tabs").innerHTML = defs.map(([id, label, count]) =>
       `<button role="tab" data-tab="${id}" aria-selected="${tab === id}">${label}${count ? `<span class="count">${count}</span>` : ""}</button>`).join("");
   };
@@ -1636,6 +1643,9 @@ async function suiteView(slug, suiteSlug, alive) {
             <button type="button" data-edit-mode="markdown" aria-pressed="false">Markdown</button>
           </div>
           <span class="detected" id="detected"></span>
+          <span class="spacer"></span>
+          <label class="btn btn-small" title="Add the test cases from a Markdown test plan (.md) file">
+            Import Markdown…<input type="file" id="import-file" accept=".md,.markdown,.txt" hidden></label>
         </div>
         ${placeholders.length ? `<div class="field values-bar"><span>Project values <span class="muted">— click to insert into the field you're editing</span></span>
           <div class="chips" id="suite-chips"></div></div>` : ""}
@@ -1709,6 +1719,29 @@ async function suiteView(slug, suiteSlug, alive) {
   form.elements.plan.addEventListener("focus", (e) => { lastField = e.target; });
   if (placeholders.length) placeholderChips($("#suite-chips"), placeholders, () => lastField);
   showEditor();
+
+  $("#import-file").addEventListener("change", async (e) => {
+    const file = e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    try {
+      const imported = await api("/plans/parse", { method: "POST", body: { plan: await file.text() } });
+      if (!imported.cases.length) throw new Error(`No test cases found in ${file.name}. Each needs a heading like “### TC-001: Title”.`);
+      if (mode !== "fields") await setMode("fields");
+      const kept = editor.cases().filter((c) => c.title.trim() || c.steps.length || c.expected.length);
+      // Imported tests get new numbers when saved, so they can't clash with this suite's IDs
+      editor.replace([...kept, ...imported.cases.map((c) => ({ ...c, id: null }))]);
+      if (!form.elements.name.value.trim() && imported.title) form.elements.name.value = imported.title;
+      if (!form.elements.notes.value.trim() && imported.notes) {
+        form.elements.notes.value = imported.notes;
+        $("#plan-notes").open = true;
+      }
+      if (!plan.url && imported.url) plan.url = imported.url;
+      toast(`Imported ${imported.cases.length} test${imported.cases.length === 1 ? "" : "s"} from ${file.name} — review, then save`);
+    } catch (ex) {
+      toast(ex.message, true);
+    }
+  });
 
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
