@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 
@@ -46,6 +47,11 @@ class TestPlan:
             cases=cases,
         )
 
+    def unknown_ids(self, ids: list[str]) -> list[str]:
+        """Return the IDs from `ids` that don't match any test case in the plan."""
+        known = {c.id.upper() for c in self.cases}
+        return [i for i in ids if i.upper() not in known]
+
     def to_markdown(self) -> str:
         """Reassemble the plan from preamble + selected cases."""
         parts = [self.preamble.rstrip()]
@@ -58,7 +64,7 @@ class TestPlan:
         if n <= 1 or len(self.cases) <= 1:
             return [self]
         chunks = []
-        size = max(1, len(self.cases) // n)
+        size = math.ceil(len(self.cases) / n)
         for i in range(0, len(self.cases), size):
             chunk_cases = self.cases[i : i + size]
             chunks.append(
@@ -84,16 +90,16 @@ _CATEGORY = re.compile(r"\*\*Category:\*\*\s*(\w+)", re.IGNORECASE)
 
 def parse_test_plan(text: str) -> TestPlan:
     """Parse a Markdown test plan into a TestPlan object."""
-    url = _extract_url(text)
-
     # Find all TC headers and their positions
     matches = list(_TC_HEADER.finditer(text))
 
     if not matches:
         # No test cases found — whole thing is preamble
-        return TestPlan(raw=text, url=url, preamble=text, cases=[])
+        return TestPlan(raw=text, url=_extract_url(text), preamble=text, cases=[])
 
     preamble = text[: matches[0].start()].rstrip()
+    # Only look for the URL in the preamble, so "URL:" inside a test step isn't picked up
+    url = _extract_url(preamble)
 
     cases: list[TestCase] = []
     for i, match in enumerate(matches):
@@ -130,3 +136,165 @@ def _extract_url(text: str) -> str | None:
         if stripped.lower().startswith("url:"):
             return stripped.split(":", 1)[1].strip()
     return None
+
+
+def plan_from_scenario(scenario: str, url: str, name: str = "Scenario") -> TestPlan:
+    """Wrap a single plain-English scenario into a one-case test plan."""
+    text = (
+        f"# Test Plan: {name}\n\n"
+        f"> URL: {url}\n\n"
+        f"## Test Cases\n\n"
+        f"### TC-001: {name}\n\n"
+        f"{scenario.strip()}\n"
+    )
+    return parse_test_plan(text)
+
+
+def renumber(case: TestCase, new_id: str) -> TestCase:
+    """A copy of the case with a new ID, including in its heading."""
+    body = _TC_HEADER.sub(lambda m: f"### {new_id}: {m.group(2).strip()}", case.raw_markdown, count=1)
+    return TestCase(new_id, case.name, body, priority=case.priority, category=case.category)
+
+
+def compose_plan(title: str, url: str | None, cases: list[TestCase]) -> str:
+    """Markdown for a plan made of the given cases, numbered TC-001 onwards."""
+    head = f"# Test Plan: {title}\n\n" + (f"> URL: {url}\n\n" if url else "") + "## Test Cases\n"
+    body = [renumber(c, f"TC-{i:03d}").raw_markdown.strip() for i, c in enumerate(cases, start=1)]
+    return head + "".join(f"\n{b}\n\n---\n" for b in body)
+
+
+def append_cases(plan_text: str, cases: list[TestCase]) -> str:
+    """Append cases to an existing plan, numbering them after its highest TC ID."""
+    existing = parse_test_plan(plan_text).cases
+    next_num = max((int(c.id.split("-")[1]) for c in existing), default=0) + 1
+    added = [renumber(c, f"TC-{next_num + i:03d}").raw_markdown.strip() for i, c in enumerate(cases)]
+    return plan_text.rstrip() + "\n" + "".join(f"\n{b}\n\n---\n" for b in added)
+
+
+# ── Structured editing ───────────────────────────────────────────────
+# The web UI edits test cases as fields; Markdown stays the storage format.
+# case_fields() and render_case() convert between the two. Text that doesn't fit
+# a field is kept in "notes", so converting never loses anything.
+
+_LABEL = re.compile(r"^\*\*(.+?):?\*\*:?\s*(.*)$")
+_PLAIN_LABEL = re.compile(
+    r"^(priority|category|preconditions?|before you start|steps|"
+    r"expected results?|expected|acceptance criteria)\s*:\s*(.*)$",
+    re.IGNORECASE,
+)
+_ITEM = re.compile(r"^(\d+[.)]|[-*•+]|\[[ xX]\])\s+(.*)$")
+_SECTIONS = {
+    "preconditions": "preconditions", "precondition": "preconditions", "before you start": "preconditions",
+    "steps": "steps",
+    "expected result": "expected", "expected results": "expected", "expected": "expected",
+    "acceptance criteria": "expected",
+}
+
+
+def case_fields(case: TestCase) -> dict:
+    """Split a test case into editable fields."""
+    fields: dict = {
+        "id": case.id, "title": case.name, "priority": "", "category": "",
+        "preconditions": [], "steps": [], "expected": [], "notes": "",
+    }
+    notes: list[str] = []
+    section: str | None = None
+    for line in case.raw_markdown.splitlines()[1:]:
+        text = line.strip()
+        if not text or text == "---":
+            continue
+        label = _LABEL.match(text) or _PLAIN_LABEL.match(text)
+        if label:
+            name, rest = label.group(1).strip().lower(), label.group(2).strip()
+            if name in ("priority", "category"):
+                fields[name] = rest.lower()
+                section = None
+                continue
+            if name in _SECTIONS:
+                section = _SECTIONS[name]
+                if rest:
+                    fields[section].append(rest)
+                continue
+        item = _ITEM.match(text)
+        if item:
+            numbered = item.group(1)[0].isdigit()
+            target = section or ("steps" if numbered else None)
+            if target:
+                fields[target].append(item.group(2).strip())
+                continue
+        if section and fields[section] and line[:1].isspace():
+            fields[section][-1] += " " + text  # wrapped continuation of the previous item
+            continue
+        section = None
+        notes.append(line.rstrip())
+    fields["notes"] = "\n".join(notes).strip()
+    return fields
+
+
+def render_case(fields: dict, case_id: str) -> str:
+    """Markdown for one test case from its fields."""
+    title = " ".join(str(fields.get("title") or "Untitled test").split())
+    out = [f"### {case_id}: {title}", ""]
+    meta = [f"**{k.title()}:** {fields[k]}" for k in ("priority", "category") if fields.get(k)]
+    if meta:
+        out += [*meta, ""]
+
+    def clean(items) -> list[str]:
+        return [" ".join(str(i).split()) for i in items or [] if str(i).strip()]
+
+    if pre := clean(fields.get("preconditions")):
+        out += ["**Preconditions:**", *[f"- {p}" for p in pre], ""]
+    if steps := clean(fields.get("steps")):
+        out += ["**Steps:**", *[f"{n}. {s}" for n, s in enumerate(steps, 1)], ""]
+    if expected := clean(fields.get("expected")):
+        out += ["**Acceptance criteria:**", *[f"- {e}" for e in expected], ""]
+    if notes := str(fields.get("notes") or "").strip():
+        out += [notes, ""]
+    return "\n".join(out).rstrip() + "\n"
+
+
+def plan_fields(text: str) -> dict:
+    """Split a plan into its title, URL, free-form notes (setup etc.), and test case fields."""
+    plan = parse_test_plan(text)
+    title = ""
+    notes: list[str] = []
+    for line in plan.preamble.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# ") and not title:
+            title = stripped[2:].removeprefix("Test Plan:").strip()
+        elif stripped.lstrip(">").strip().lower().startswith("url:") or stripped.lower() == "## test cases":
+            continue
+        else:
+            notes.append(line.rstrip())
+    return {
+        "title": title,
+        "url": plan.url,
+        "notes": "\n".join(notes).strip(),
+        "cases": [case_fields(c) for c in plan.cases],
+    }
+
+
+def render_plan(data: dict) -> str:
+    """Markdown for a plan from plan_fields()-shaped data. Existing test IDs are kept;
+    new cases (no ID, or a duplicate) get the next free number."""
+    cases = data.get("cases") or []
+    used = {str(c.get("id")).upper() for c in cases if c.get("id")}
+    numbers = [int(i.split("-")[1]) for i in used if re.fullmatch(r"TC-\d+", i)]
+    next_num = max(numbers, default=0) + 1
+    seen: set[str] = set()
+    blocks = []
+    for fields in cases:
+        case_id = str(fields.get("id") or "").upper()
+        if not re.fullmatch(r"TC-\d+", case_id) or case_id in seen:
+            case_id = f"TC-{next_num:03d}"
+            next_num += 1
+        seen.add(case_id)
+        blocks.append(render_case(fields, case_id).strip())
+
+    head = [f"# Test Plan: {data.get('title') or 'Untitled'}", ""]
+    if data.get("url"):
+        head += [f"> URL: {data['url']}", ""]
+    if str(data.get("notes") or "").strip():
+        head += [str(data["notes"]).strip(), ""]
+    head += ["## Test Cases", ""]
+    return "\n".join(head) + "\n" + "\n\n---\n\n".join(blocks) + "\n"

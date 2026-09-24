@@ -17,12 +17,21 @@ Systematically explore the website at {url} and build a comprehensive map of wha
 ## Credentials
 {credentials}
 
+## Focus
+{focus}
+
+## Safety rules
+{guardrails}
+
 ## Rules
 - Take screenshots frequently to document what you see.
 - Click on things! Don't just read the DOM — interact like a real user.
 - If credentials are provided above, USE THEM to log in so you can explore authenticated areas.
 - If you hit a dead end, go back and try a different path.
 - Be thorough but efficient — don't visit the same page twice.
+- Take screenshots with a bare filename like `explore_1.png` (no directory).
+- If the browser itself doesn't work (won't launch, tools error out), stop and set `"environment_error"` \
+to the exact error message.
 
 ## Output Format
 
@@ -64,7 +73,8 @@ Return a structured JSON report:
       "page": "/path"
     }}
   ],
-  "tech_stack_hints": ["React", "Tailwind", "etc"]
+  "tech_stack_hints": ["React", "Tailwind", "etc"],
+  "environment_error": null
 }}
 ```
 """

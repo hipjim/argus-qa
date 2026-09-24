@@ -66,5 +66,6 @@ Include happy paths, error cases, and edge cases. \
 Write steps in plain English — be specific about what to click, what to type, what to check. \
 Use the actual page names, button labels, and field names you observed.
 
+{project_guidance}
 Output ONLY the Markdown content. No wrapping code fences. No preamble.
 """
