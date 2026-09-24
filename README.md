@@ -188,6 +188,8 @@ Every run has a **cost limit**, estimated at Anthropic API prices. Agents stop w
 | `GET /runs` | Recent runs, newest first |
 | `GET /runs/{id}` | Run status, summary, failed test IDs, cost |
 | `POST /runs/{id}/cancel` | Cancel a queued or running run |
+| `DELETE /runs/{id}` | Delete a finished run and its files (tests already saved to suites are kept) |
+| `POST /runs/delete` | Delete several finished runs: `{"ids": [...]}`; active or unknown runs are skipped |
 | `POST /runs/{id}/rerun` | Start a new run of the same plan; `{"failed_only": true}` (default) re-runs just the failures |
 | `GET /runs/{id}/events?after=N` | Live agent activity (actions, narration, phases). Poll with `after` set to the returned `next` |
 | `GET /runs/{id}/plan` | The plan that was run |

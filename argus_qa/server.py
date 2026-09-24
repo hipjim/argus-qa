@@ -174,6 +174,10 @@ class AcceptRequest(BaseModel):
         return self
 
 
+class DeleteRunsRequest(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=500, description="Run IDs to delete.")
+
+
 class RerunRequest(BaseModel):
     failed_only: bool = Field(True, description="Re-run only the tests that failed or were blocked.")
 
@@ -487,6 +491,16 @@ class RunManager:
 
         return self._start(run, job)
 
+    def delete(self, run_id: str) -> None:
+        """Remove a finished run and everything it saved (results, report, screenshots, activity)."""
+        run = self.runs.get(run_id)
+        if run is None:
+            raise HTTPException(404, f"Run {run_id} not found.")
+        if run.status not in FINISHED:
+            raise HTTPException(409, f"Run {run_id} is {run.status}; cancel it before deleting it.")
+        shutil.rmtree(self.run_dir(run_id), ignore_errors=True)
+        del self.runs[run_id]
+
     def cancel(self, run_id: str) -> bool:
         task = self.tasks.get(run_id)
         if task is None:
@@ -717,6 +731,24 @@ def create_app(data_dir: str | Path = "argus-data", max_concurrent: int = 2) -> 
     @api.get("/runs/{run_id}")
     async def read_run(run_id: str) -> Run:
         return get_run(run_id)
+
+    @api.delete("/runs/{run_id}", status_code=status.HTTP_204_NO_CONTENT)
+    async def delete_run(run_id: str) -> Response:
+        """Delete a finished run and its files. Tests already saved to suites are kept."""
+        manager.delete(run_id)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @api.post("/runs/delete")
+    async def delete_runs(body: DeleteRunsRequest) -> dict:
+        """Delete several finished runs. Runs that are missing or still active are skipped."""
+        deleted, skipped = [], []
+        for run_id in dict.fromkeys(body.ids):
+            try:
+                manager.delete(run_id)
+                deleted.append(run_id)
+            except HTTPException as e:
+                skipped.append({"id": run_id, "reason": e.detail})
+        return {"deleted": deleted, "skipped": skipped}
 
     @api.post("/runs/{run_id}/rerun", status_code=status.HTTP_202_ACCEPTED)
     async def rerun(run_id: str, body: RerunRequest | None = None) -> Run:

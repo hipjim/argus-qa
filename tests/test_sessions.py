@@ -269,3 +269,64 @@ async def test_agents_stopped_at_limit_are_explained(client, monkeypatch):
         run = await _finished(client, run["id"])
     assert run["status"] == "failed"
     assert "stopped early at the cost or turn limit ($5.00)" in run["error"]
+
+
+# ── deleting runs ────────────────────────────────────────────
+
+
+async def test_delete_run(client, fakes, tmp_path):
+    async with client:
+        await client.post("/projects", json=PROJECT)
+        await client.post("/projects/looma/suites", json={"name": "Smoke", "plan": SUITE_PLAN})
+        run = (await client.post("/projects/looma/suites/smoke/run", json={})).json()
+        await _finished(client, run["id"])
+        assert (tmp_path / "runs" / run["id"]).is_dir()
+
+        assert (await client.delete(f"/runs/{run['id']}")).status_code == 204
+        assert not (tmp_path / "runs" / run["id"]).exists()
+        assert (await client.get(f"/runs/{run['id']}")).status_code == 404
+        assert (await client.get("/runs")).json() == []
+        assert (await client.get("/projects/looma/suites")).json()[0]["last_run"] is None
+        assert (await client.delete(f"/runs/{run['id']}")).status_code == 404
+
+
+async def test_cannot_delete_active_run(client, fakes):
+    fakes["gate"].clear()
+    async with client:
+        await client.post("/projects", json=PROJECT)
+        run = (await client.post("/runs", json={"project": "looma", "scenario": "x"})).json()
+        resp = await client.delete(f"/runs/{run['id']}")
+        assert resp.status_code == 409 and "cancel it" in resp.text
+        fakes["gate"].set()
+        await _finished(client, run["id"])
+        assert (await client.delete(f"/runs/{run['id']}")).status_code == 204
+
+
+async def test_deleting_session_keeps_accepted_tests(client, fakes):
+    async with client:
+        await client.post("/projects", json=PROJECT)
+        run = (await client.post("/projects/looma/discover")).json()
+        await _finished(client, run["id"])
+        await client.post(f"/runs/{run['id']}/accept", json={"suite_name": "Found"})
+        assert (await client.delete(f"/runs/{run['id']}")).status_code == 204
+        assert (await client.get("/projects/looma/suites/found")).json()["test_count"] == 3
+
+
+async def test_bulk_delete(client, fakes):
+    fakes["gate"].clear()
+    async with client:
+        await client.post("/projects", json=PROJECT)
+        fakes["gate"].set()
+        done = [(await client.post("/runs", json={"project": "looma", "scenario": "x"})).json()["id"] for _ in range(2)]
+        for run_id in done:
+            await _finished(client, run_id)
+        fakes["gate"].clear()
+        active = (await client.post("/runs", json={"project": "looma", "scenario": "x"})).json()["id"]
+
+        resp = (await client.post("/runs/delete", json={"ids": [*done, active, "nope", done[0]]})).json()
+        assert resp["deleted"] == done
+        assert [s["id"] for s in resp["skipped"]] == [active, "nope"]
+        assert [r["id"] for r in (await client.get("/runs")).json()] == [active]
+        assert (await client.post("/runs/delete", json={"ids": []})).status_code == 422
+        fakes["gate"].set()
+        await _finished(client, active)

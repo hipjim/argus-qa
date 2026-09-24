@@ -260,6 +260,8 @@ async function runsView(params, alive) {
       <label class="sr-only" for="project-filter">Project</label>
       <select id="project-filter"><option value="">All projects</option>${options}</select>
       <span class="muted small" id="run-count"></span>
+      <span class="spacer"></span>
+      <button class="btn btn-small btn-danger" id="delete-selected" hidden></button>
     </div>
     <div id="runs-table"></div>`;
 
@@ -268,6 +270,34 @@ async function runsView(params, alive) {
   });
 
   const names = Object.fromEntries(projects.map((p) => [p.slug, p.name]));
+  const selected = new Set();
+  let current = runs;
+  const syncSelection = () => {
+    const ids = new Set(current.map((r) => r.id));
+    [...selected].forEach((id) => { if (!ids.has(id)) selected.delete(id); });
+    const btn = view.querySelector("#delete-selected");
+    btn.hidden = selected.size === 0;
+    btn.textContent = `Delete ${selected.size} run${selected.size === 1 ? "" : "s"}`;
+    const all = view.querySelector("#select-all-runs");
+    if (all) {
+      const deletable = current.filter((r) => !ACTIVE.has(r.status)).length;
+      all.checked = deletable > 0 && selected.size === deletable;
+      all.indeterminate = selected.size > 0 && selected.size < deletable;
+    }
+  };
+  view.querySelector("#delete-selected").addEventListener("click", async () => {
+    const ids = [...selected];
+    if (!confirm(`Delete ${ids.length} run${ids.length === 1 ? "" : "s"} and their screenshots and reports? Tests already saved to suites are kept.`)) return;
+    try {
+      const result = await api("/runs/delete", { method: "POST", body: { ids } });
+      selected.clear();
+      toast(`Deleted ${result.deleted.length} run${result.deleted.length === 1 ? "" : "s"}${result.skipped.length ? `, skipped ${result.skipped.length} still running` : ""}`);
+      route();
+    } catch (ex) {
+      toast(ex.message, true);
+    }
+  });
+
   const drawOverview = (list) => {
     const target = view.querySelector("#overview");
     if (!list.length) { target.hidden = true; return; }
@@ -296,6 +326,7 @@ async function runsView(params, alive) {
   };
 
   const draw = (list) => {
+    current = list;
     document.body.classList.toggle("live", list.some((r) => ACTIVE.has(r.status)));
     drawOverview(list);
     view.querySelector("#run-count").textContent = list.length ? `${list.length} run${list.length === 1 ? "" : "s"}` : "";
@@ -309,10 +340,12 @@ async function runsView(params, alive) {
       return;
     }
     target.innerHTML = `<table class="table">
-      <thead><tr><th>Status</th><th>Run</th><th class="hide-sm">Project</th><th>Result</th>
+      <thead><tr><th class="check"><input type="checkbox" id="select-all-runs" aria-label="Select all finished runs"></th><th>Status</th><th>Run</th><th class="hide-sm">Project</th><th>Result</th>
       <th class="hide-sm">Started</th><th class="hide-sm">Duration</th><th class="hide-sm">Cost</th></tr></thead>
       <tbody>${list.map((r) => `
-        <tr data-id="${esc(r.id)}">
+        <tr data-id="${esc(r.id)}" class="${selected.has(r.id) ? "is-selected" : ""}">
+          <td class="check"><input type="checkbox" value="${esc(r.id)}" ${selected.has(r.id) ? "checked" : ""}
+            ${ACTIVE.has(r.status) ? 'disabled title="Cancel it first"' : ""} aria-label="Select run ${esc(r.id)}"></td>
           <td>${statusBadge(r.status)}</td>
           <td><a class="row-link" href="#/runs/${esc(r.id)}"><div class="title">${r.kind !== "test" ? `<span class="kind ${esc(r.kind)}">${r.kind === "discover" ? "Discover" : "Explore"}</span>` : ""}${esc(r.kind !== "test" ? (r.brief || "Whole app") : (r.title || r.test_ids.join(", ")))}</div>
             <div class="id">${esc(r.id)} · ${esc(new URL(r.url).host)}</div></a></td>
@@ -324,8 +357,18 @@ async function runsView(params, alive) {
           <td class="num hide-sm">${esc(cost(r.cost_usd))}</td>
         </tr>`).join("")}</tbody></table>`;
     target.querySelectorAll("tbody tr").forEach((tr) => tr.addEventListener("click", (e) => {
-      if (!e.target.closest("a")) location.hash = `#/runs/${tr.dataset.id}`;
+      if (!e.target.closest("a, .check")) location.hash = `#/runs/${tr.dataset.id}`;
     }));
+    target.querySelectorAll("tbody .check input").forEach((box) => box.addEventListener("change", () => {
+      if (box.checked) selected.add(box.value); else selected.delete(box.value);
+      box.closest("tr").classList.toggle("is-selected", box.checked);
+      syncSelection();
+    }));
+    target.querySelector("#select-all-runs").addEventListener("change", (e) => {
+      list.filter((r) => !ACTIVE.has(r.status)).forEach((r) => (e.target.checked ? selected.add(r.id) : selected.delete(r.id)));
+      draw(list);
+    });
+    syncSelection();
   };
 
   draw(runs);
@@ -610,6 +653,9 @@ async function runView(runId, alive) {
       if (run.failed_ids.length) actions.push(`<button class="btn btn-primary" data-act="rerun-failed">Re-run ${run.failed_ids.length} failed</button>`);
       actions.push(`<button class="btn" data-act="rerun-all">Re-run all</button>`);
     }
+    if (!ACTIVE.has(run.status)) {
+      actions.push(`<button class="btn btn-ghost btn-small btn-danger" data-act="delete">Delete</button>`);
+    }
     if (results && !session) {
       actions.push(`<button class="btn btn-ghost btn-small" data-act="dl-junit">junit.xml</button>`);
       actions.push(`<button class="btn btn-ghost btn-small" data-act="dl-results">results.json</button>`);
@@ -649,6 +695,12 @@ async function runView(runId, alive) {
       } else if (act === "rerun-failed" || act === "rerun-all") {
         const fresh = await api(`/runs/${runId}/rerun`, { method: "POST", body: { failed_only: act === "rerun-failed" } });
         location.hash = `#/runs/${fresh.id}`;
+      } else if (act === "delete") {
+        const extra = session && run.accepted?.length ? " Tests already saved to suites are kept." : "";
+        if (!confirm(`Delete this run and its screenshots, report, and activity log?${extra}`)) return;
+        await api(`/runs/${runId}`, { method: "DELETE" });
+        toast("Run deleted");
+        location.hash = run.project ? `#/runs?project=${encodeURIComponent(run.project)}` : "#/runs";
       } else if (act === "dl-junit") {
         download(`/runs/${runId}/junit`, `argus-${runId}-junit.xml`);
       } else if (act === "dl-results") {
