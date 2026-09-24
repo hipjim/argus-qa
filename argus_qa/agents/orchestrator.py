@@ -82,6 +82,22 @@ def model_for(role: str) -> str:
     )
 
 
+# Whether each tester action returns a snapshot of the page ("full") or the tester asks
+# for one when it needs to look ("none", the default: measured cheaper with the same
+# results). Set with ARGUS_TESTER_SNAPSHOTS.
+def tester_snapshots() -> bool:
+    return os.environ.get("ARGUS_TESTER_SNAPSHOTS", "none").lower() == "full"
+
+
+_PAGE_READING = {
+    True: "After each action you get a snapshot of the page; use it rather than asking for a new one.",
+    False: (
+        "Actions don't return the page. Call `browser_snapshot` when you need to see it (after "
+        "navigating, or to check a result); element refs from an older snapshot may be stale."
+    ),
+}
+
+
 # Turn limits per agent, so a confused agent can't loop forever
 TESTER_MAX_TURNS = 300
 EXPLORER_MAX_TURNS = 150
@@ -112,6 +128,7 @@ def _make_playwright_mcp(
     isolated: bool = False,
     output_dir: Path | None = None,
     images: bool = True,
+    snapshots: bool = True,
 ) -> dict:
     """Create a Playwright MCP config.
 
@@ -135,6 +152,9 @@ def _make_playwright_mcp(
         args.extend(["--output-dir", str(output_dir.resolve())])
     if not images:
         args.extend(["--image-responses", "omit"])
+    if not snapshots:
+        # Actions don't return the page; the agent asks for a snapshot when it needs one
+        args.extend(["--snapshot-mode", "none"])
     return {"playwright": {"command": "npx", "args": args}}
 
 
@@ -146,6 +166,7 @@ def _browser_options(
     max_turns: int | None = TESTER_MAX_TURNS,
     model: str | None = None,
     images: bool = True,
+    snapshots: bool = True,
 ) -> ClaudeAgentOptions:
     """Options for agents that need browser access.
 
@@ -155,7 +176,8 @@ def _browser_options(
     """
     return ClaudeAgentOptions(
         mcp_servers=_make_playwright_mcp(
-            headless=headless, isolated=isolated, output_dir=output_dir, images=images
+            headless=headless, isolated=isolated, output_dir=output_dir, images=images,
+            snapshots=snapshots,
         ),
         model=model,
         tools=[],
@@ -772,16 +794,19 @@ async def _run_test_chunk(
     Isolated agents get their own in-memory browser profile so multiple chunks
     can run in parallel without conflicts.
     """
+    snapshots = tester_snapshots()
     prompt = TESTER_PROMPT.format(
         url=url,
         test_plan=substitute(plan.to_markdown(), project),
         screenshot_dir=str(screenshot_dir),
         project_context=project.prompt_section() if project else "",
+        page_reading=_PAGE_READING[snapshots],
     )
     options = _browser_options(
         headless=headless, isolated=isolated, output_dir=screenshot_dir, max_budget_usd=max_budget_usd,
         model=model_for("tester"),
         images=False,  # it reads the page as text; screenshots are evidence for people
+        snapshots=snapshots,
     )
     return await _run_agent(prompt, options, label=label, redact=redact)
 

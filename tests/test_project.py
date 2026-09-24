@@ -346,3 +346,28 @@ async def test_session_agents_get_role_models(project, tmp_path, monkeypatch):
     hunter = next(iter(seen.values()))
     assert hunter.model == "claude-opus-5-5"
     assert "--image-responses" not in hunter.mcp_servers["playwright"]["args"]  # sees pages to spot visual bugs
+
+
+def test_tester_snapshot_mode(monkeypatch):
+    monkeypatch.delenv("ARGUS_TESTER_SNAPSHOTS", raising=False)
+    assert orchestrator.tester_snapshots() is False
+    args = orchestrator._browser_options(snapshots=False).mcp_servers["playwright"]["args"]
+    assert args[args.index("--snapshot-mode") + 1] == "none"
+    monkeypatch.setenv("ARGUS_TESTER_SNAPSHOTS", "full")
+    assert orchestrator.tester_snapshots() is True
+    assert "--snapshot-mode" not in orchestrator._browser_options(snapshots=True).mcp_servers["playwright"]["args"]
+
+
+async def test_tester_prompt_explains_page_reading(tmp_path, monkeypatch):
+    prompts = []
+
+    async def fake_agent(prompt, options, label="", redact=None):
+        prompts.append(prompt)
+        return orchestrator.AgentRun(text=json.dumps({"results": [{"id": "TC-001", "status": "passed"}]}), ok=True)
+
+    monkeypatch.setattr(orchestrator, "_run_agent", fake_agent)
+    monkeypatch.delenv("ARGUS_TESTER_SNAPSHOTS", raising=False)
+    plan = parse_test_plan("### TC-001: X\n\n1. y\n")
+    await orchestrator.execute_plan(plan, "https://app.test", tmp_path / "run")
+    assert "Call `browser_snapshot` when you need to see it" in prompts[0]
+    assert "browser_fill_form" in prompts[0] and "browser_run_code_unsafe" in prompts[0]

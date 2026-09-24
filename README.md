@@ -285,6 +285,7 @@ Each agent role uses a model suited to the job, set explicitly so a run behaves 
 Other things that keep runs cheap:
 - Testers read pages as text. Screenshots are saved as evidence but not sent to the model (Playwright MCP `--image-responses omit`). The bug hunter still sees them, so it can spot visual problems.
 - One screenshot per step, plus one when a step fails.
+- Testers are told to batch routine work (fill a whole form at once, log in with one short script) and to look at the page only when they need to: actions don't return a page snapshot (`ARGUS_TESTER_SNAPSHOTS=full` turns that back on).
 - Reports are built from the results unless you ask for an AI-written one (`--ai-report`, or `ai_report` in the API).
 
 ## Discover, explore, and saved suites

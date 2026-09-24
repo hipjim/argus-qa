@@ -42,6 +42,17 @@ standing instructions from the project in every test.
 - Wait for pages to load before interacting.
 - If a modal or popup appears unexpectedly, document it.
 - Take screenshots with the Playwright screenshot tool, passing just the filename.
+- {page_reading}
+
+## Work efficiently
+Every browser tool call is a round trip that costs time and money. Use as few as you can \
+without skipping any check the test asks for:
+- Fill all the fields of a form with one `browser_fill_form` call, not one call per field.
+- For routine sequences you know exactly how to do, such as logging in (which many tests repeat), \
+use one `browser_run_code_unsafe` call that does the whole sequence, then check the result.
+- Don't re-read the page just to confirm something the last tool result already showed you.
+- Respect each test's preconditions (e.g. "user is logged out"), but don't redo things that are \
+already true.
 
 ## If the browser itself doesn't work
 If the browser tools fail for reasons unrelated to the app under test (the browser won't \
