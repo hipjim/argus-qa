@@ -746,13 +746,14 @@ async function newRunView(params, alive) {
         <span>What to test</span>
         <div class="segmented" role="group" aria-label="Input type">
           <button type="button" data-mode="quick" aria-pressed="true">Quick test</button>
-          <button type="button" data-mode="suite" aria-pressed="false" id="suite-mode-btn" hidden>Suite</button>
+          <button type="button" data-mode="suite" aria-pressed="false" id="suite-mode-btn">Saved suite</button>
         </div>
         <span class="hint" id="mode-hint">One test, run now. It isn't saved, apart from the run's results.</span>
       </div>
 
       <div id="mode-quick" class="tc-editor"></div>
 
+      <div id="mode-suite-empty" class="notice" hidden></div>
       <div id="mode-suite" class="form" style="gap:14px" hidden>
         <label class="field"><span>Suite</span><select name="suite"></select>
           <span class="hint" id="suite-hint"></span></label>
@@ -806,12 +807,23 @@ async function newRunView(params, alive) {
   const setMode = (next) => {
     mode = next;
     view.querySelectorAll("[data-mode]").forEach((x) => x.setAttribute("aria-pressed", String(x.dataset.mode === mode)));
+    const noSuites = !suites.length;
     view.querySelector("#mode-quick").hidden = mode !== "quick";
-    view.querySelector("#mode-suite").hidden = mode !== "suite";
+    view.querySelector("#mode-suite").hidden = mode !== "suite" || noSuites;
     view.querySelector("#placeholders").classList.toggle("off", mode === "suite");
     view.querySelector("#mode-hint").textContent = mode === "quick"
-      ? "One test, run now. It isn't saved, apart from the run's results."
-      : "A saved set of tests from this project.";
+      ? "Write one test below and run it now. It isn't saved, apart from the run's results."
+      : "Run some or all of a project's saved tests.";
+    // Explain why there's nothing to pick, and what to do about it
+    const empty = view.querySelector("#mode-suite-empty");
+    const slug = form.elements.project.value;
+    empty.hidden = mode !== "suite" || !noSuites;
+    empty.innerHTML = !slug
+      ? "Saved suites belong to a project. Pick a project above to run one of its suites."
+      : `<b>${esc(byName[slug]?.name || slug)}</b> has no saved suites yet. `
+        + `<a href="#/projects/${esc(slug)}/discover">Discover tests</a> to have argus-qa propose some, or `
+        + `<a href="#/projects/${esc(slug)}/suites/new">write a suite</a>.`;
+    view.querySelector("#submit-btn").disabled = mode === "suite" && noSuites;
     lastFocused = null;
   };
   const drawSuite = () => {
@@ -830,14 +842,13 @@ async function newRunView(params, alive) {
     const slug = form.elements.project.value;
     suites = slug ? await api(`/projects/${encodeURIComponent(slug)}/suites`).catch(() => []) : [];
     if (!alive() || slug !== form.elements.project.value) return;
-    view.querySelector("#suite-mode-btn").hidden = !suites.length;
     form.elements.suite.innerHTML = suites.map((st) => `<option value="${esc(st.slug)}">${esc(st.name)} (${st.test_count} test${st.test_count === 1 ? "" : "s"})</option>`).join("");
     const preferred = params.get("suite");
     if (preferred && suites.some((st) => st.slug === preferred)) {
       form.elements.suite.value = preferred;
       setMode("suite");
-    } else if (mode === "suite" && !suites.length) {
-      setMode("quick");
+    } else {
+      setMode(mode);
     }
     drawSuite();
   };
