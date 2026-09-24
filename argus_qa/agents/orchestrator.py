@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import os
@@ -21,8 +22,12 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ResultMessage,
     TextBlock,
+    ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
+    create_sdk_mcp_server,
     query,
+    tool,
 )
 
 from argus_qa import colors as c
@@ -35,17 +40,20 @@ from argus_qa.prompts.explorer import EXPLORER_PROMPT
 from argus_qa.prompts.guardrails import GUARDRAILS
 from argus_qa.prompts.reporter import REPORTER_PROMPT
 from argus_qa.prompts.scaffold import SCAFFOLD_PROMPT
-from argus_qa.prompts.tester import TESTER_PROMPT
+from argus_qa.prompts.tester import RECORDING_INSTRUCTIONS, TESTER_PROMPT
 from argus_qa.results import (
     bugs_to_cases,
     discovery_report,
     exploration_report,
     extract_json,
     merge_results,
+    script_result,
+    summarize,
     test_report,
     to_junit,
 )
 from argus_qa.results import failed_ids as _failed_ids
+from argus_qa.scripts import CHECK_KINDS, RecordedTest, Recorder, build_script, ensure_runner, replay
 
 AGENT_NAMES = [
     "Chad the Clicker",
@@ -111,13 +119,20 @@ _STOP_REASONS = {
 }
 
 
-def install_browser() -> None:
-    """Download the Chromium build that the pinned Playwright MCP version uses."""
-    core_version = subprocess.run(
+@functools.cache
+def playwright_core_version() -> str:
+    """The Playwright version behind the pinned Playwright MCP (so the script runner matches it)."""
+    return subprocess.run(
         ["npm", "view", PLAYWRIGHT_MCP_PACKAGE, "dependencies.playwright-core"],
         capture_output=True, text=True, check=True,
     ).stdout.strip()
+
+
+def install_browser() -> None:
+    """Download the Chromium build that the pinned Playwright MCP version uses, and the script runner."""
+    core_version = playwright_core_version()
     subprocess.run(["npx", "-y", f"playwright-core@{core_version}", "install", "chromium"], check=True)
+    ensure_runner(core_version)
 
 
 def _pick_agent_name() -> str:
@@ -159,6 +174,54 @@ def _make_playwright_mcp(
     return {"playwright": {"command": "npx", "args": args}}
 
 
+def _tool_text(text: str, error: bool = False) -> dict:
+    return {"content": [{"type": "text", "text": text}], **({"is_error": True} if error else {})}
+
+
+_CHECK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "test_id": {"type": "string", "description": "The test case ID, e.g. TC-003"},
+        "criterion": {"type": "string", "description": "The acceptance criterion, as written in the test"},
+        "kind": {"type": "string", "enum": list(CHECK_KINDS)},
+        "text": {"type": "string", "description": "text_visible / text_hidden: exact text on the page"},
+        "role": {"type": "string", "description": "element_visible: ARIA role, e.g. button, heading, link"},
+        "name": {"type": "string", "description": "element_visible: the element's accessible name"},
+        "label": {"type": "string", "description": "field_value: the field's label"},
+        "value": {"type": "string", "description": "url_contains: part of the URL; field_value: the value"},
+    },
+    "required": ["test_id", "criterion", "kind"],
+}
+
+
+def _argus_tools():
+    """In-process tools the tester uses to mark tests, steps, and checks while recording."""
+
+    @tool("start_test", "Call at the very start of each test case, before resetting the browser.",
+          {"test_id": str})
+    async def start_test(args):
+        return _tool_text(f"Recording {args.get('test_id', '')}. Now reset the browser as instructed.")
+
+    @tool("start_step", "Call right before doing a step's actions. Step 0 is the test's preconditions.",
+          {"test_id": str, "step": int})
+    async def start_step(args):
+        return _tool_text(f"Step {args.get('step')} of {args.get('test_id', '')}.")
+
+    @tool("check", "Record one acceptance criterion that holds, as something a script can verify later.",
+          _CHECK_SCHEMA)
+    async def check(args):
+        kind = args.get("kind")
+        needs = {"text_visible": "text", "text_hidden": "text", "element_visible": "role",
+                 "url_contains": "value", "field_value": "label"}.get(kind)
+        if kind not in CHECK_KINDS:
+            return _tool_text(f"Unknown kind {kind!r}; use one of {', '.join(CHECK_KINDS)}.", error=True)
+        if needs and not args.get(needs):
+            return _tool_text(f"A {kind} check needs `{needs}`.", error=True)
+        return _tool_text("Recorded.")
+
+    return create_sdk_mcp_server(name="argus", tools=[start_test, start_step, check])
+
+
 def _browser_options(
     headless: bool = False,
     isolated: bool = False,
@@ -168,6 +231,7 @@ def _browser_options(
     model: str | None = None,
     images: bool = True,
     snapshots: bool = True,
+    record: bool = False,
 ) -> ClaudeAgentOptions:
     """Options for agents that need browser access.
 
@@ -175,14 +239,16 @@ def _browser_options(
     directory: Playwright MCP resolves explicit screenshot filenames against its
     working directory, while --output-dir only covers auto-named files.
     """
+    servers = _make_playwright_mcp(
+        headless=headless, isolated=isolated, output_dir=output_dir, images=images, snapshots=snapshots,
+    )
+    if record:
+        servers["argus"] = _argus_tools()
     return ClaudeAgentOptions(
-        mcp_servers=_make_playwright_mcp(
-            headless=headless, isolated=isolated, output_dir=output_dir, images=images,
-            snapshots=snapshots,
-        ),
+        mcp_servers=servers,
         model=model,
         tools=[],
-        allowed_tools=["mcp__playwright__*"],
+        allowed_tools=["mcp__playwright__*", *(["mcp__argus__*"] if record else [])],
         cwd=str(output_dir.resolve()) if output_dir is not None else None,
         max_budget_usd=max_budget_usd,
         max_turns=max_turns,
@@ -208,6 +274,7 @@ class AgentRun:
     cost_usd: float = 0.0
     turns: int = 0
     models: list[str] = field(default_factory=list)
+    recording: dict[str, RecordedTest] | None = None
 
 
 def _models(runs: list[AgentRun]) -> list[str]:
@@ -220,8 +287,11 @@ async def _run_agent(
     options: ClaudeAgentOptions,
     label: str = "",
     redact: Redactor | None = None,
+    recorder: Recorder | None = None,
 ) -> AgentRun:
-    """Run a single agent query and return its final result, with secrets redacted."""
+    """Run a single agent query and return its final result, with secrets redacted.
+
+    A recorder, if given, sees every tool call and result (for recording scripts)."""
     redact = redact or Redactor()
     run = AgentRun(text="", ok=False)
     async for message in query(prompt=prompt, options=options):
@@ -240,8 +310,16 @@ async def _run_agent(
                         else:
                             print(f"  {c.DIM}>{c.RESET} {line}")
                 elif isinstance(block, ToolUseBlock):
-                    tool, text, extra = describe_tool(block.name, block.input)
-                    emit("action", redact(text), agent=label, tool=tool, **extra)
+                    if recorder is not None:
+                        recorder.on_tool_use(block.id, block.name, block.input)
+                    if block.name.startswith("mcp__argus__"):
+                        continue
+                    tool_name, text, extra = describe_tool(block.name, block.input)
+                    emit("action", redact(text), agent=label, tool=tool_name, **extra)
+        elif isinstance(message, UserMessage) and recorder is not None:
+            for block in message.content if isinstance(message.content, list) else []:
+                if isinstance(block, ToolResultBlock):
+                    recorder.on_tool_result(block.tool_use_id, block.content, block.is_error)
         elif isinstance(message, ResultMessage):
             run.cost_usd = message.total_cost_usd or 0.0
             run.turns = message.num_turns
@@ -572,6 +650,7 @@ class RunResult:
     failed_ids: list[str] = field(default_factory=list)
     cost_usd: float = 0.0
     models: list[str] = field(default_factory=list)
+    recorded: dict[str, str] = field(default_factory=dict)  # test ID -> verified script
 
     @property
     def environment_error(self) -> str | None:
@@ -672,6 +751,13 @@ async def run_tests(
     return result
 
 
+RUN_MODES = ("ai", "script", "auto")
+
+
+def _n(count: int, word: str) -> str:
+    return f"{count} {word}{'' if count == 1 else 's'}"
+
+
 async def execute_plan(
     plan: TestPlan,
     url: str,
@@ -683,8 +769,18 @@ async def execute_plan(
     project: Project | None = None,
     max_cost_usd: float | None = None,
     ai_report: bool = False,
+    mode: str = "ai",
+    scripts: dict[str, Path] | None = None,
+    record: bool = False,
 ) -> RunResult:
     """Run the given test cases, write results/report/JUnit to run_dir, and return the outcome.
+
+    mode "ai" runs every test with a tester agent. "script" replays recorded
+    scripts (test ID -> .mjs in `scripts`) without AI; tests without one are
+    blocked. "auto" replays scripts and hands any test whose script failed, or
+    that has none, to the AI: if the AI passes it, the test is "healed" (the
+    site changed but still works). With record, tests the AI passes get a new
+    script, kept only if it replays successfully (RunResult.recorded).
 
     Set isolated when other runs may be using a browser at the same time. The
     project's secrets are given to tester agents but redacted from everything
@@ -692,9 +788,12 @@ async def execute_plan(
     results unless ai_report is set, in which case an agent writes it and gets 10% of
     max_cost_usd; the tester agents share the rest.
     """
+    if mode not in RUN_MODES:
+        raise ValueError(f"Unknown run mode {mode!r}; use one of {', '.join(RUN_MODES)}.")
     tester_share = 0.9 if ai_report else 1.0
     substitute(plan.to_markdown(), project)  # fail fast on unknown {{placeholders}}
     redact = Redactor(project.secret_values() if project else [])
+    values = project.placeholder_values() if project else {}
     run_dir.mkdir(parents=True, exist_ok=True)
     ss_dir = screenshot_dir or run_dir / "screenshots"
     ss_dir.mkdir(parents=True, exist_ok=True)
@@ -704,74 +803,111 @@ async def execute_plan(
     print(f"\n  {c.BOLD}{total}{c.RESET} test cases selected: {c.DIM}{case_ids}{c.RESET}")
     print(f"  Screenshots {c.DIM}→{c.RESET} {c.info(str(ss_dir))}")
 
-    # ── Phase 1: Execute tests (sequential or parallel) ─────────
-    used_names: set[str] = set()
+    # ── Scripts first (no AI) ───────────────────────────────────
+    script_passed: dict[str, dict] = {}
+    script_failed: dict[str, dict] = {}
+    scripts = scripts or {}
+    if mode in ("script", "auto"):
+        to_replay = {tc.id: scripts[tc.id] for tc in plan.cases if tc.id in scripts}
+        if to_replay:
+            print(c.phase(1, 2, f"Replaying {len(to_replay)} recorded script(s) without AI..."))
+            emit("phase", f"Replaying {_n(len(to_replay), 'recorded script')} without AI")
+            runner = await asyncio.to_thread(ensure_runner)
+            replayed = await replay(to_replay, url, values, ss_dir, runner)
+            for tc in plan.cases:
+                if tc.id not in replayed:
+                    continue
+                entry = script_result(tc, replayed[tc.id])
+                seconds = replayed[tc.id].get("duration_ms", 0) / 1000
+                if entry["status"] == "passed":
+                    script_passed[tc.id] = entry
+                    emit("phase", f"{tc.id} passed by script in {seconds:.1f}s")
+                else:
+                    script_failed[tc.id] = entry
+                    emit("error", f"{tc.id} script failed: {entry['notes']}")
 
-    def _unique_name() -> str:
-        available = [n for n in AGENT_NAMES if n not in used_names]
-        if not available:
-            available = AGENT_NAMES
-        name = random.choice(available)
-        used_names.add(name)
-        return name
-
-    if parallel <= 1 or total <= 1:
-        tester_name = _unique_name()
-        print(c.phase(1, 2, f"{tester_name} is running {total} tests..."))
-        emit("phase", f"{tester_name} is running {total} test{'s' if total != 1 else ''}")
-        runs = [await _run_test_chunk(
-            url, plan, ss_dir, label=tester_name, headless=headless, isolated=isolated,
-            project=project, redact=redact, max_budget_usd=_share(max_cost_usd, tester_share),
-        )]
+    if mode == "script":
+        ai_cases: list[TestCase] = []
+    elif mode == "auto":
+        ai_cases = [tc for tc in plan.cases if tc.id not in script_passed]
     else:
-        chunks = plan.split_chunks(min(parallel, total))
-        print(c.phase(1, 2, f"Assembling the testing squad ({len(chunks)} agents)..."))
-        emit("phase", f"{len(chunks)} agents are splitting {total} tests")
-        tasks = []
-        for chunk in chunks:
-            chunk_ids = ", ".join(tc.id for tc in chunk.cases)
-            name = _unique_name()
-            color = c.agent_color(name)
-            print(f"  {color}{c.BOLD}{name}{c.RESET}: {c.DIM}{chunk_ids}{c.RESET}")
-            emit("phase", f"{name} takes {chunk_ids}", agent=name)
-            tasks.append(
-                _run_test_chunk(
-                    url, chunk, ss_dir, label=name, headless=True, isolated=True,
-                    project=project, redact=redact,
-                    max_budget_usd=_share(max_cost_usd, tester_share / len(chunks)),
-                )
-            )
-        print()
-        runs = await asyncio.gather(*tasks)
+        ai_cases = list(plan.cases)
+
+    # ── AI for the rest ─────────────────────────────────────────
+    runs: list[AgentRun] = []
+    ai_merged: dict = {"results": [], "bugs": [], "overall_assessment": ""}
+    if ai_cases:
+        ai_plan = TestPlan(raw=plan.raw, url=plan.url, preamble=plan.preamble, cases=ai_cases)
+        if script_failed and mode == "auto":
+            emit("phase", f"Healing {_n(len(script_failed), 'test')} with AI")
+        runs = await _run_testers(
+            ai_plan, url, ss_dir, parallel=parallel, headless=headless, isolated=isolated, project=project,
+            redact=redact, budget=_share(max_cost_usd, tester_share), record=record,
+        )
+        ai_merged = merge_results([r.text for r in runs], ai_plan)
 
     # Page snapshots and other text the browser saved can contain secrets shown or typed on the page
     _redact_text_files(ss_dir, redact)
 
-    # Merge results
-    merged_results = redact.data(merge_results([r.text for r in runs], plan))
-    (run_dir / "results.json").write_text(json.dumps(merged_results, indent=2))
-    (run_dir / "junit.xml").write_text(to_junit(merged_results))
+    ai_by_id = {r["id"]: r for r in ai_merged["results"]}
+    results = []
+    for tc in plan.cases:
+        if tc.id in script_passed:
+            results.append(script_passed[tc.id])
+        elif tc.id in ai_by_id:
+            entry = {**ai_by_id[tc.id], "mode": "ai"}
+            failure = script_failed.get(tc.id)
+            if failure and entry["status"] == "passed":
+                entry["healed"] = True
+                entry["notes"] = (
+                    f"Healed: the recorded script failed ({failure['notes']}), but the AI completed "
+                    f"the test, so the page probably changed. {entry.get('notes') or ''}"
+                ).strip()
+            elif failure:
+                entry["notes"] = (
+                    f"The recorded script failed too: {failure['notes']}. {entry.get('notes') or ''}"
+                ).strip()
+            results.append(entry)
+        elif tc.id in script_failed:
+            results.append(script_failed[tc.id])
+        else:
+            results.append({
+                "id": tc.id, "name": tc.name, "status": "blocked", "mode": "script", "steps": [],
+                "notes": "No script is recorded for this test yet. Run it with AI or Auto to record one.",
+            })
+
+    merged = {
+        **{k: v for k, v in ai_merged.items() if k != "results"},
+        "summary": summarize(results),
+        "results": results,
+    }
+
+    # ── Record scripts from what the AI just did ────────────────
+    recorded: dict[str, str] = {}
+    if record and runs and not merged.get("environment_errors"):
+        recorded = await _record_scripts(plan, runs, results, url, project, run_dir)
+
+    merged = redact.data(merged)
+    (run_dir / "results.json").write_text(json.dumps(merged, indent=2))
+    (run_dir / "junit.xml").write_text(to_junit(merged))
     print(c.success("\n  Tests complete.\n"))
 
     runs_cost = sum(r.cost_usd for r in runs)
-    if merged_results.get("environment_errors"):
+    if merged.get("environment_errors"):
         # Nothing about the app was learned; skip the report
-        problem = "; ".join(merged_results["environment_errors"])
+        problem = "; ".join(merged["environment_errors"])
         print(c.error(f"  Browser/environment problem: {problem}"))
         emit("error", f"The browser couldn't run the tests: {problem}")
-        return RunResult(run_dir=run_dir, report_file=run_dir / "report.md", results=merged_results,
+        return RunResult(run_dir=run_dir, report_file=run_dir / "report.md", results=merged,
                          failed_ids=[], cost_usd=runs_cost, models=_models(runs))
 
-    # Print quick summary
-    summary = merged_results["summary"]
-    print(c.result_bar(
-        summary["passed"],
-        summary["failed"],
-        summary["blocked"],
-        summary["skipped"],
-    ))
+    summary = merged["summary"]
+    print(c.result_bar(summary["passed"], summary["failed"], summary["blocked"], summary["skipped"]))
+    if summary.get("by_script"):
+        how = f"{summary['by_script']} by script, {summary['by_ai']} by AI, {summary['healed']} healed"
+        print(c.dim(f"  {how}"))
 
-    # ── Phase 2: Report ─────────────────────────────────────────
+    # ── Report ──────────────────────────────────────────────────
     agents = list(runs)
     report_file = run_dir / "report.md"
     if ai_report:
@@ -781,7 +917,7 @@ async def execute_plan(
             prompt=REPORTER_PROMPT.format(
                 exploration_report="(not available — ran from existing test plan)",
                 test_plan=plan.to_markdown(),
-                test_results=json.dumps(merged_results, indent=2),
+                test_results=json.dumps(merged, indent=2),
                 screenshot_dir=str(ss_dir),
             ),
             options=_reasoning_options(max_budget_usd=_share(max_cost_usd, 0.1), model=model_for("writer")),
@@ -791,27 +927,131 @@ async def execute_plan(
         agents.append(report)
         report_file.write_text(report.text)
     else:
-        report_file.write_text(test_report(merged_results, plan, url))
+        report_file.write_text(test_report(merged, plan, url))
     print(c.success(f"\n  Report saved to {report_file}\n"))
 
     # Save failed test IDs for re-runs
-    failed = _failed_ids(merged_results)
+    failed = _failed_ids(merged)
     if failed:
         failures_file = run_dir / "failures.txt"
         failures_file.write_text("\n".join(failed) + "\n")
         print(c.warn(f"  Failed tests saved to {failures_file}"))
 
     cost = sum(a.cost_usd for a in agents)
-    print(c.dim(f"  Cost: ${cost:.2f}   Models: {', '.join(_models(agents)) or 'unknown'}"))
+    print(c.dim(f"  Cost: ${cost:.2f}   Models: {', '.join(_models(agents)) or 'none (scripts only)'}"))
 
     return RunResult(
         run_dir=run_dir,
         report_file=report_file,
-        results=merged_results,
+        results=merged,
         failed_ids=failed,
         cost_usd=cost,
         models=_models(agents),
+        recorded=recorded,
     )
+
+
+async def _run_testers(
+    plan: TestPlan,
+    url: str,
+    ss_dir: Path,
+    parallel: int,
+    headless: bool,
+    isolated: bool,
+    project: Project | None,
+    redact: Redactor,
+    budget: float | None,
+    record: bool,
+) -> list[AgentRun]:
+    """Run tester agents over the plan: one agent, or parallel agents on chunks of it."""
+    used_names: set[str] = set()
+
+    def _unique_name() -> str:
+        available = [n for n in AGENT_NAMES if n not in used_names] or AGENT_NAMES
+        name = random.choice(available)
+        used_names.add(name)
+        return name
+
+    total = len(plan.cases)
+    if parallel <= 1 or total <= 1:
+        tester_name = _unique_name()
+        print(c.phase(1, 2, f"{tester_name} is running {total} tests..."))
+        emit("phase", f"{tester_name} is running {total} test{'s' if total != 1 else ''}")
+        return [await _run_test_chunk(
+            url, plan, ss_dir, label=tester_name, headless=headless, isolated=isolated,
+            project=project, redact=redact, max_budget_usd=budget, record=record,
+        )]
+
+    chunks = plan.split_chunks(min(parallel, total))
+    print(c.phase(1, 2, f"Assembling the testing squad ({len(chunks)} agents)..."))
+    emit("phase", f"{len(chunks)} agents are splitting {total} tests")
+    tasks = []
+    for chunk in chunks:
+        chunk_ids = ", ".join(tc.id for tc in chunk.cases)
+        name = _unique_name()
+        color = c.agent_color(name)
+        print(f"  {color}{c.BOLD}{name}{c.RESET}: {c.DIM}{chunk_ids}{c.RESET}")
+        emit("phase", f"{name} takes {chunk_ids}", agent=name)
+        tasks.append(
+            _run_test_chunk(
+                url, chunk, ss_dir, label=name, headless=True, isolated=True,
+                project=project, redact=redact, record=record,
+                max_budget_usd=_share(budget, 1 / len(chunks)) if budget else None,
+            )
+        )
+    print()
+    return list(await asyncio.gather(*tasks))
+
+
+async def _record_scripts(
+    plan: TestPlan,
+    runs: list[AgentRun],
+    results: list[dict],
+    url: str,
+    project: Project | None,
+    run_dir: Path,
+) -> dict[str, str]:
+    """Build scripts for tests the AI passed, and keep the ones that replay successfully."""
+    recordings = {}
+    for run in runs:
+        recordings.update(run.recording or {})
+    values = project.placeholder_values() if project else {}
+    secrets = project.secret_placeholders() if project else set()
+    status = {r["id"]: r for r in results}
+    drafts: dict[str, Path] = {}
+    draft_dir = run_dir / "scripts"
+    for tc in plan.cases:
+        entry = status.get(tc.id)
+        if not entry or entry.get("mode") != "ai" or entry.get("status") != "passed":
+            continue
+        recording = recordings.get(tc.id.upper())
+        if recording is None:
+            entry["script"] = "not recorded: the tester didn't mark this test's steps"
+            continue
+        script, reason = build_script(tc, recording, url, values, secrets)
+        if script is None:
+            entry["script"] = f"not recorded: {reason}"
+            continue
+        draft_dir.mkdir(parents=True, exist_ok=True)
+        drafts[tc.id] = draft_dir / f"{tc.id}.mjs"
+        drafts[tc.id].write_text(script)
+    if not drafts:
+        return {}
+
+    emit("phase", f"Checking {_n(len(drafts), 'recorded script')} by replaying them")
+    runner = await asyncio.to_thread(ensure_runner)
+    verified = await replay(drafts, url, values, run_dir / "verify", runner)
+    recorded = {}
+    for tc_id, path in drafts.items():
+        result = verified.get(tc_id, {})
+        if result.get("status") == "passed":
+            recorded[tc_id] = path.read_text()
+            status[tc_id]["script"] = "recorded"
+        else:
+            problem = result.get("error") or "no result"
+            status[tc_id]["script"] = f"not recorded: the script didn't replay ({problem})"
+    emit("phase", f"Recorded {_n(len(recorded), 'script')} for replay without AI")
+    return recorded
 
 
 _TEXT_ARTIFACTS = {".yml", ".yaml", ".md", ".txt", ".json", ".log", ".html"}
@@ -838,11 +1078,13 @@ async def _run_test_chunk(
     project: Project | None = None,
     redact: Redactor | None = None,
     max_budget_usd: float | None = None,
+    record: bool = False,
 ) -> AgentRun:
     """Run a chunk of test cases in one agent.
 
     Isolated agents get their own in-memory browser profile so multiple chunks
-    can run in parallel without conflicts.
+    can run in parallel without conflicts. With record, the agent marks steps and
+    checks with the argus tools, and the run carries per-test recordings.
     """
     snapshots = tester_snapshots()
     prompt = TESTER_PROMPT.format(
@@ -851,14 +1093,20 @@ async def _run_test_chunk(
         screenshot_dir=str(screenshot_dir),
         project_context=project.prompt_section() if project else "",
         page_reading=_PAGE_READING[snapshots],
+        recording=RECORDING_INSTRUCTIONS if record else "",
     )
     options = _browser_options(
         headless=headless, isolated=isolated, output_dir=screenshot_dir, max_budget_usd=max_budget_usd,
         model=model_for("tester"),
         images=False,  # it reads the page as text; screenshots are evidence for people
         snapshots=snapshots,
+        record=record,
     )
-    return await _run_agent(prompt, options, label=label, redact=redact)
+    recorder = Recorder() if record else None
+    run = await _run_agent(prompt, options, label=label, redact=redact, recorder=recorder)
+    if recorder is not None:
+        run.recording = recorder.tests()
+    return run
 
 
 # ── Watch mode ──────────────────────────────────────────────────────

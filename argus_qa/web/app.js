@@ -385,6 +385,58 @@ async function runsView(params, alive) {
   }, LIST_POLL_MS);
 }
 
+// ── Run modes & scripts ──────────────────────────────────────────────
+
+const RUN_MODES = [
+  ["auto", "Auto", "Replay recorded scripts without AI; the AI steps in only for tests without a script or whose script fails, and re-records them."],
+  ["script", "Script only", "Replay recorded scripts only: no AI, no cost. Tests without a script are blocked."],
+  ["ai", "AI", "Run every test with AI, and re-record their scripts."],
+];
+const MODE_LABEL = Object.fromEntries(RUN_MODES.map(([k, label]) => [k, label]));
+
+function modeSelect(name, value = "auto") {
+  return `<select name="${name}" aria-label="How to run">${RUN_MODES.map(([k, label]) =>
+    `<option value="${k}" ${k === value ? "selected" : ""}>${label}</option>`).join("")}</select>`;
+}
+const modeDescription = (k) => (RUN_MODES.find(([m]) => m === k) || [])[2] || "";
+
+function scriptBadge(script) {
+  const st = script?.status || "none";
+  if (st === "ready") return `<span class="script-badge ready" title="Recorded ${esc(relTime(script.recorded_at))}; replays without AI">script</span>`;
+  if (st === "outdated") return `<span class="script-badge outdated" title="The test changed after its script was recorded; the next Auto run re-records it">script outdated</span>`;
+  return `<span class="script-badge none" title="No script yet; the next Auto or AI run records one">no script</span>`;
+}
+
+async function showScript(project, suite, testId) {
+  let code;
+  try {
+    code = await api(`/projects/${encodeURIComponent(project)}/suites/${encodeURIComponent(suite)}/scripts/${encodeURIComponent(testId)}`);
+  } catch (ex) {
+    toast(ex.message, true);
+    return;
+  }
+  const dialog = document.createElement("dialog");
+  dialog.className = "dialog code-dialog";
+  dialog.innerHTML = `<form method="dialog">
+    <h2>Script for ${esc(testId)}</h2>
+    <p class="muted small">Recorded from an AI run and replayed with plain Playwright. <code>v('…')</code> reads project values; <code>url('…')</code> is relative to the run's URL.</p>
+    <pre class="plan-src">${esc(code)}</pre>
+    <div class="dialog-actions">
+      <button class="btn btn-danger" value="forget" type="submit">Forget script</button>
+      <span class="spacer"></span>
+      <button class="btn btn-primary" value="close">Close</button>
+    </div></form>`;
+  document.body.append(dialog);
+  dialog.addEventListener("close", async () => {
+    if (dialog.returnValue === "forget" && confirm(`Forget the script for ${testId}? The next Auto or AI run records a new one.`)) {
+      await api(`/projects/${encodeURIComponent(project)}/suites/${encodeURIComponent(suite)}/scripts/${encodeURIComponent(testId)}`, { method: "DELETE" })
+        .then(() => { toast("Script forgotten"); route(); }).catch((ex) => toast(ex.message, true));
+    }
+    dialog.remove();
+  });
+  dialog.showModal();
+}
+
 // ── Test case editor ─────────────────────────────────────────────────
 // Edits test cases as fields (title, priority, steps, acceptance criteria…). The server
 // converts to and from Markdown (/plans/parse, /plans/render), which stays the storage format.
@@ -419,7 +471,7 @@ function unknownPlaceholders(text, known) {
  *          onChange() (after any edit)
  * Returns { cases() } giving the current state.
  */
-function caseEditor(container, initial, { single = false, project = null, placeholders = [], onFocus = () => {}, onChange = () => {} } = {}) {
+function caseEditor(container, initial, { single = false, project = null, placeholders = [], onFocus = () => {}, onChange = () => {}, badge = () => "" } = {}) {
   let cases = initial.length ? initial.map((c) => ({ ...emptyCase(), ...c })) : [emptyCase()];
   const known = new Set(placeholders);
   let drag = null;
@@ -437,6 +489,7 @@ function caseEditor(container, initial, { single = false, project = null, placeh
       <header class="tc-head">
         ${single ? "" : `<span class="tc-grip tc-card-grip" draggable="true" title="Drag to reorder test cases">⋮⋮</span>`}
         <span class="case-id">${esc(c.id || "new")}</span>
+        ${c.id ? badge(c.id) : ""}
         <input class="tc-title" value="${esc(c.title)}" placeholder="What does this test check?" aria-label="Test title">
         <select class="tc-priority" aria-label="Priority"><option value="">Priority</option>
           ${PRIORITIES.map((p) => `<option ${c.priority === p ? "selected" : ""}>${p}</option>`).join("")}</select>
@@ -703,6 +756,8 @@ async function newRunView(params, alive) {
       <div id="mode-suite" class="form" style="gap:14px" hidden>
         <label class="field"><span>Suite</span><select name="suite"></select>
           <span class="hint" id="suite-hint"></span></label>
+        <label class="field"><span>How to run</span>${modeSelect("run_mode")}
+          <span class="hint" id="run-mode-hint">${esc(modeDescription("auto"))}</span></label>
         <fieldset class="suite-picks">
           <legend class="small">Tests to run</legend>
           <label class="select-all"><input type="checkbox" id="suite-all" checked> All</label>
@@ -767,7 +822,7 @@ async function newRunView(params, alive) {
       + `<a href="#/projects/${esc(form.elements.project.value)}/suites/${esc(suite.slug)}">Edit suite</a>`;
     view.querySelector("#suite-tests").innerHTML = suite.tests.map((t) => `
       <label class="suite-test"><input type="checkbox" value="${esc(t.id)}" checked>
-        <span class="case-id">${esc(t.id)}</span> ${esc(t.name)}</label>`).join("");
+        <span class="case-id">${esc(t.id)}</span> ${esc(t.name)} ${scriptBadge(t.script)}</label>`).join("");
     view.querySelector("#suite-all").checked = true;
     view.querySelector("#suite-all").indeterminate = false;
   };
@@ -787,6 +842,9 @@ async function newRunView(params, alive) {
     drawSuite();
   };
   form.elements.suite.addEventListener("change", drawSuite);
+  form.elements.run_mode.addEventListener("change", (e) => {
+    view.querySelector("#run-mode-hint").textContent = modeDescription(e.target.value);
+  });
   view.querySelector("#suite-all").addEventListener("change", (e) => {
     view.querySelectorAll("#suite-tests input").forEach((b) => { b.checked = e.target.checked; });
   });
@@ -833,6 +891,7 @@ async function newRunView(params, alive) {
         return;
       }
       if (picked.length < boxes.length) body.only = picked;
+      body.mode = f.run_mode.value;
     } else {
       const [test] = quick.cases();
       if (!test.steps.length) {
@@ -924,6 +983,7 @@ async function runView(runId, alive) {
     document.title = `${mark} ${run.status === "running" ? "Running" : run.status[0].toUpperCase() + run.status.slice(1)} · ${title} — argus-qa`.trim();
     $("#run-meta").innerHTML = [
       session ? `<span class="kind ${esc(run.kind)}">${run.kind === "discover" ? "Discover" : "Explore"}</span>` : "",
+      run.suite ? `<span class="kind mode-${esc(run.mode)}" title="${esc(modeDescription(run.mode))}">${esc(MODE_LABEL[run.mode] || run.mode)}</span>` : "",
       statusBadge(run.status),
       run.project ? `<a href="#/projects/${esc(run.project)}">${esc(run.project)}</a>` : "",
       `<a class="mono" href="${esc(run.url)}" target="_blank" rel="noopener">${esc(run.url)}</a>`,
@@ -949,9 +1009,11 @@ async function runView(runId, alive) {
     }
     $("#run-actions").innerHTML = actions.join("");
 
-    $("#run-banner").innerHTML = run.error
+    const how = run.summary?.by_script !== undefined
+      ? `<div class="how-run"><b>${run.summary.by_script}</b> by script · <b>${run.summary.by_ai}</b> by AI${run.summary.healed ? ` · <b class="healed">${run.summary.healed} healed</b> (the page changed; scripts re-recorded)` : ""}</div>` : "";
+    $("#run-banner").innerHTML = (run.error
       ? `<div class="banner">${esc(run.error)}</div>`
-      : run.status === "queued" ? `<div class="banner info">Waiting for a free browser slot…</div>` : "";
+      : run.status === "queued" ? `<div class="banner info">Waiting for a free browser slot…</div>` : "") + how;
 
     const s = run.summary || { passed: 0, failed: 0, blocked: 0, skipped: 0 };
     const score = (cls, n, label) => `<div class="score ${cls} ${n ? "" : "zero"}"><b>${n}</b><span>${label}</span></div>`;
@@ -1051,7 +1113,8 @@ async function runView(runId, alive) {
       </div>`).join("");
     const cases = results.results.map((r) => `
       <article class="case">
-        <div class="case-head"><span class="case-id">${esc(r.id)}</span><span class="case-name">${esc(r.name || "")}</span>${statusBadge(r.status)}</div>
+        <div class="case-head"><span class="case-id">${esc(r.id)}</span><span class="case-name">${esc(r.name || "")}</span>${ranBy(r)}${statusBadge(r.status)}</div>
+        ${r.script ? `<p class="script-note ${r.script === "recorded" ? "ok" : ""}">${r.script === "recorded" ? "✓ Script recorded: next time this test replays without AI" : esc(r.script.replace(/^not recorded: /, "No script recorded: "))}</p>` : ""}
         ${r.notes ? `<p class="case-notes" title="Click to expand">${esc(r.notes)}</p>` : ""}
         ${(r.steps || []).length ? `<ol class="steps">${r.steps.map((st) => `
           <li class="step ${esc(st.status || "")}">
@@ -1064,6 +1127,13 @@ async function runView(runId, alive) {
           </li>`).join("")}</ol>` : ""}
       </article>`).join("");
     return (bugs ? `<section class="bugs"><h2 class="section-label">Bugs found</h2>${bugs}</section>` : "") + cases;
+  };
+
+  const ranBy = (r) => {
+    if (r.healed) return `<span class="ran-by healed" title="Its script failed, the AI completed it: the page changed">healed by AI</span>`;
+    if (r.mode === "script") return `<span class="ran-by script">script${r.duration_ms ? ` · ${(r.duration_ms / 1000).toFixed(1)}s` : ""}</span>`;
+    if (r.mode === "ai") return `<span class="ran-by ai">AI</span>`;
+    return "";
   };
 
   const waiting = (what) => `<p class="muted">${ACTIVE.has(run.status)
@@ -1257,8 +1327,9 @@ async function runView(runId, alive) {
       const [verb, ...rest] = ev.text.split(": ");
       el.innerHTML = `${time}<div class="ev-body">${who}<span class="verb">${esc(verb)}</span>${rest.length ? ` ${esc(rest.join(": "))}` : ""}</div>`;
       if (ev.file) {
-        el.querySelector(".ev-body").insertAdjacentHTML("beforeend", `<img class="ev-thumb" data-shot="${esc(ev.file)}" alt="${esc(ev.file)}">`);
-        setTimeout(() => hydrateImages(el, runId), 1500); // give the browser a moment to write the file
+        el.querySelector(".ev-body").insertAdjacentHTML("beforeend", `<img class="ev-thumb" data-shot="${esc(ev.file)}" alt="" aria-label="${esc(ev.file)}">`);
+        // During a live run, give the browser a moment to write the file
+        setTimeout(() => hydrateImages(el, runId), ACTIVE.has(run.status) ? 1500 : 0);
       }
     } else if (ev.kind === "say") {
       el.innerHTML = `${time}<div class="ev-body">${who}<div class="ev-text">${esc(ev.text)}</div></div>`;
@@ -1628,8 +1699,9 @@ async function suiteView(slug, suiteSlug, alive) {
     <a class="crumb" href="${base}">← ${esc(project.name)}</a>
     <div class="page-head">
       <div><h1>${isNew ? "New test suite" : esc(suite.name)}</h1>
-        <p class="sub">${isNew ? "A saved set of test cases you can run with one click." : `${suite.test_count} test${suite.test_count === 1 ? "" : "s"} · updated ${esc(relTime(suite.updated_at))}`}</p></div>
+        <p class="sub">${isNew ? "A saved set of test cases you can run with one click." : `${suite.test_count} test${suite.test_count === 1 ? "" : "s"} · ${suite.scripts_ready} with a recorded script · updated ${esc(relTime(suite.updated_at))}`}</p></div>
       ${isNew ? "" : `<div class="page-head-actions">
+        <label class="inline-field" title="${esc(modeDescription("auto"))}">Run with ${modeSelect("suite_mode")}</label>
         <label class="inline-field">Parallel <input id="suite-parallel" type="number" min="1" max="8" value="1"></label>
         <button class="btn btn-primary" id="run-suite">Run suite</button>
       </div>`}
@@ -1683,8 +1755,10 @@ async function suiteView(slug, suiteSlug, alive) {
     $("#detected").textContent = `${n} test case${n === 1 ? "" : "s"}`;
   };
   const showEditor = () => {
+    const scripts = Object.fromEntries((suite?.tests || []).map((t) => [t.id, t.script]));
     editor = caseEditor($("#cases"), plan.cases, {
       project: slug, placeholders, onFocus: (el) => { lastField = el; }, onChange: () => editor && countCases(),
+      badge: (id) => (suite ? `<button type="button" class="badge-btn" data-script="${esc(id)}" ${scripts[id]?.status === "none" || !scripts[id] ? "disabled" : ""}>${scriptBadge(scripts[id])}</button>` : ""),
     });
     countCases();
   };
@@ -1715,6 +1789,10 @@ async function suiteView(slug, suiteSlug, alive) {
     if (mode === "fields") showEditor(); else countCases();
   };
   view.querySelectorAll("[data-edit-mode]").forEach((b) => b.addEventListener("click", () => setMode(b.dataset.editMode)));
+  $("#cases").addEventListener("click", (e) => {
+    const id = e.target.closest("[data-script]")?.dataset.script;
+    if (id) showScript(slug, suiteSlug, id);
+  });
   form.elements.plan.addEventListener("input", countCases);
   form.elements.plan.addEventListener("focus", (e) => { lastField = e.target; });
   if (placeholders.length) placeholderChips($("#suite-chips"), placeholders, () => lastField);
@@ -1775,7 +1853,7 @@ async function suiteView(slug, suiteSlug, alive) {
     e.target.disabled = true;
     try {
       const run = await api(`/projects/${encodeURIComponent(slug)}/suites/${encodeURIComponent(suiteSlug)}/run`, {
-        method: "POST", body: { parallel: Number($("#suite-parallel").value) || 1 },
+        method: "POST", body: { parallel: Number($("#suite-parallel").value) || 1, mode: view.querySelector('select[name="suite_mode"]').value },
       });
       location.hash = `#/runs/${run.id}`;
     } catch (ex) {

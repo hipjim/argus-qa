@@ -55,10 +55,12 @@ from argus_qa.plan_parser import (
     render_plan,
 )
 from argus_qa.project import MASK, Project, slugify, substitute
+from argus_qa.scripts import case_hash
 
 WEB_DIR = Path(__file__).parent / "web"
 
 RunKind = Literal["test", "discover", "explore"]
+RunMode = Literal["auto", "script", "ai"]
 RunStatus = Literal["queued", "running", "passed", "failed", "completed", "error", "cancelled"]
 FINISHED: set[str] = {"passed", "failed", "completed", "error", "cancelled"}
 
@@ -142,6 +144,11 @@ class SuiteModel(BaseModel):
 
 
 class SuiteRunRequest(BaseModel):
+    mode: RunMode = Field(
+        "auto",
+        description="auto: replay recorded scripts and let the AI heal any that fail; "
+        "script: replay only, no AI; ai: run every test with AI (re-recording scripts).",
+    )
     only: list[str] | None = None
     parallel: int = Field(1, ge=1, le=8)
     url: HttpUrl | None = None
@@ -217,6 +224,7 @@ class Run(BaseModel):
     id: str
     kind: RunKind = "test"
     status: RunStatus
+    mode: RunMode = "ai"
     title: str = ""
     project: str | None = None
     suite: str | None = None
@@ -315,6 +323,49 @@ class SuiteStore:
     def delete(self, project: str, slug: str) -> None:
         self.get(project, slug)
         self._path(project, slug).unlink()
+        shutil.rmtree(self._scripts_dir(project, slug), ignore_errors=True)
+
+    # Recorded scripts: <suite>.scripts/<TC-ID>.mjs, plus <TC-ID>.json with the wording it was recorded for
+
+    def _scripts_dir(self, project: str, slug: str) -> Path:
+        return self.dir / project / f"{slug}.scripts"
+
+    def script_path(self, project: str, slug: str, test_id: str) -> Path:
+        return self._scripts_dir(project, slug) / f"{test_id.upper()}.mjs"
+
+    def script_status(self, project: str, slug: str, plan: TestPlan) -> dict[str, dict]:
+        status = {}
+        for tc in plan.cases:
+            meta_path = self.script_path(project, slug, tc.id).with_suffix(".json")
+            if not meta_path.is_file() or not self.script_path(project, slug, tc.id).is_file():
+                status[tc.id] = {"status": "none"}
+                continue
+            meta = json.loads(meta_path.read_text())
+            fresh = meta.get("case_hash") == case_hash(tc)
+            status[tc.id] = {"status": "ready" if fresh else "outdated",
+                             "recorded_at": meta.get("recorded_at"), "run_id": meta.get("run_id")}
+        return status
+
+    def fresh_scripts(self, project: str, slug: str, plan: TestPlan) -> dict[str, Path]:
+        """Scripts recorded for the tests' current wording (test ID -> .mjs)."""
+        status = self.script_status(project, slug, plan)
+        ready = [tid for tid, st in status.items() if st["status"] == "ready"]
+        return {tid: self.script_path(project, slug, tid) for tid in ready}
+
+    def save_script(self, project: str, slug: str, case, script: str, run_id: str, models: list[str]) -> None:
+        path = self.script_path(project, slug, case.id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(script)
+        path.with_suffix(".json").write_text(json.dumps({
+            "case_hash": case_hash(case), "recorded_at": _now(), "run_id": run_id, "models": models,
+        }, indent=2))
+
+    def delete_script(self, project: str, slug: str, test_id: str) -> None:
+        path = self.script_path(project, slug, test_id)
+        if not path.is_file():
+            raise HTTPException(404, f"No script recorded for {test_id}.")
+        path.unlink()
+        path.with_suffix(".json").unlink(missing_ok=True)
 
     def delete_project(self, project: str) -> None:
         shutil.rmtree(self.dir / project, ignore_errors=True)
@@ -430,7 +481,11 @@ class RunManager:
 
     # test runs
 
-    def submit(self, req: RunRequest, *, suite: str | None = None, title: str | None = None) -> Run:
+    def submit(
+        self, req: RunRequest, *, suite: str | None = None, title: str | None = None, mode: RunMode = "ai"
+    ) -> Run:
+        """Queue a test run. Runs of a saved suite replay and record scripts according to `mode`;
+        other runs always use AI."""
         project = self._project(req.project)
         url = str(req.url) if req.url else (project.url if project else None)
         plan = _build_plan(req, url)
@@ -445,8 +500,10 @@ class RunManager:
             raise HTTPException(422, str(e)) from e
 
         max_cost = req.max_cost_usd or self.costs["test"]
+        in_suite = bool(suite and project)
         run = self._new_run(
             "test",
+            mode=mode if in_suite else "ai",
             title=title or req.name or plan_title(plan),
             project=project.slug if project else None,
             suite=suite,
@@ -459,10 +516,18 @@ class RunManager:
         (self.run_dir(run.id) / "plan.md").write_text(plan.to_markdown())
 
         async def job() -> None:
+            scripts = self.suites.fresh_scripts(project.slug, suite, plan) if in_suite else {}
             result = await execute_plan(
                 plan, run.url, self.run_dir(run.id), parallel=req.parallel, headless=True,
                 isolated=True, project=project, max_cost_usd=max_cost, ai_report=req.ai_report,
+                mode=run.mode, scripts=scripts, record=in_suite,
             )
+            cases = {tc.id: tc for tc in plan.cases}
+            for test_id, script in result.recorded.items():
+                if test_id in cases:
+                    self.suites.save_script(
+                        project.slug, suite, cases[test_id], script, run.id, result.models
+                    )
             run.summary = result.results["summary"]
             run.failed_ids = result.failed_ids
             run.cost_usd = round(result.cost_usd, 4)
@@ -630,10 +695,12 @@ def create_app(data_dir: str | Path = "argus-data", max_concurrent: int = 2) -> 
             key=lambda r: r.created_at, reverse=True,
         )
         last = runs[0] if runs else None
+        scripts = suites.script_status(suite.project, suite.slug, plan)
         view = {
             **suite.model_dump(exclude={"plan"}),
             "test_count": len(plan.cases),
-            "tests": _case_summary(plan),
+            "tests": [{**t, "script": scripts.get(t["id"], {"status": "none"})} for t in _case_summary(plan)],
+            "scripts_ready": sum(1 for st in scripts.values() if st["status"] == "ready"),
             "last_run": {"id": last.id, "status": last.status, "summary": last.summary,
                          "created_at": last.created_at} if last else None,
         }
@@ -741,8 +808,24 @@ def create_app(data_dir: str | Path = "argus-data", max_concurrent: int = 2) -> 
             RunRequest(plan=suite.plan, project=slug, only=body.only, parallel=body.parallel,
                        url=body.url, max_cost_usd=body.max_cost_usd, ai_report=body.ai_report,
                        callback_url=body.callback_url),
-            suite=suite.slug, title=suite.name,
+            suite=suite.slug, title=suite.name, mode=body.mode,
         )
+
+    @api.get("/projects/{slug}/suites/{suite_slug}/scripts/{test_id}", response_class=PlainTextResponse)
+    async def read_script(slug: str, suite_slug: str, test_id: str) -> PlainTextResponse:
+        """The recorded Playwright script for one test (JavaScript)."""
+        suites.get(slug, suite_slug)
+        path = suites.script_path(slug, suite_slug, test_id)
+        if not path.is_file():
+            raise HTTPException(404, f"No script recorded for {test_id}.")
+        return PlainTextResponse(path.read_text(), media_type="text/javascript")
+
+    @api.delete("/projects/{slug}/suites/{suite_slug}/scripts/{test_id}", status_code=204)
+    async def delete_script(slug: str, suite_slug: str, test_id: str) -> Response:
+        """Forget a test's script; the next Auto or AI run records a new one."""
+        suites.get(slug, suite_slug)
+        suites.delete_script(slug, suite_slug, test_id)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     # ── editing helpers ──────────────────────────────────────
 
@@ -824,7 +907,7 @@ def create_app(data_dir: str | Path = "argus-data", max_concurrent: int = 2) -> 
                 parallel=run.parallel,
                 max_cost_usd=run.max_cost_usd,
             ),
-            suite=run.suite, title=run.title,
+            suite=run.suite, title=run.title, mode=run.mode,
         )
 
     @api.get("/runs/{run_id}/proposed")

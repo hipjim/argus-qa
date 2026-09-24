@@ -270,6 +270,28 @@ curl -X POST localhost:8080/runs -H 'content-type: application/json' -d '{
 - Passwords and `secrets` are given to the tester agent only. They are masked in API responses and replaced with `[redacted]` in results, reports, JUnit output, and logs; the report-writing agent never sees them.
 - On the server, `${VAR}` references resolve against the server's environment, and project files are stored readable only by the server's user.
 
+## Scripts: run without AI, heal with AI
+
+Every saved suite test gets a **script**: when a test passes with AI, argus-qa records what the agent did as a plain Playwright script (Playwright reports the code for each action; the agent marks steps and turns each acceptance criterion into a check). A script is kept only after it has replayed successfully once. Scripts contain no secrets (`v('member.password')` reads project values) and no hard-coded host (`url('/login')`), and each test replays in a fresh browser.
+
+Suite runs have three modes:
+
+| Mode | What happens | Cost |
+|------|--------------|------|
+| **Auto** (default) | Replay each test's script. If it fails, or there's no script yet, the AI runs that test. If the AI passes it, the test is marked **healed** (the page changed but still works) and its script is re-recorded; if the AI fails too, it's a real failure. | $0 when nothing changed |
+| **Script only** | Replay scripts; any mismatch fails. Tests without a script are blocked. Fast and free, good for CI. | $0 |
+| **AI** | Every test runs with AI, and scripts are re-recorded. | as before |
+
+Measured on the practice site's 6-test suite: recording with AI $0.81; **Script only 12s, $0.00** (2–3s per test); Auto $0.26 (scripts for the 4 passing tests, AI for the 2 known-bug tests). A simulated redesign (renamed button) was healed by the AI for $0.14 and the script re-recorded.
+
+Editing a test makes its script *outdated*; the next Auto run re-records it. On the suite page each test shows `script`, `script outdated`, or `no script`; click the badge to read the script or forget it. Criteria that need judgement (“the layout looks right”) can't become checks, so such tests stay AI-only. Scripts are for saved suites; quick tests always use AI. Replays use the same Playwright and Chromium as the agents (`argus-qa setup` installs both).
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /projects/{slug}/suites/{suite}/run` | `"mode": "auto"` (default), `"script"`, or `"ai"` |
+| `GET /projects/{slug}/suites/{suite}/scripts/{test}` | A test's recorded script (JavaScript) |
+| `DELETE /projects/{slug}/suites/{suite}/scripts/{test}` | Forget it; the next Auto or AI run records a new one |
+
 ## Models and cost
 
 Each agent role uses a model suited to the job, set explicitly so a run behaves the same on every machine:

@@ -55,6 +55,7 @@ use one `browser_run_code_unsafe` call that does the whole sequence, then check 
 - Respect each test's preconditions (e.g. "user is logged out"), but don't redo things that are \
 already true.
 
+{recording}
 ## If the browser itself doesn't work
 If the browser tools fail for reasons unrelated to the app under test (the browser won't \
 launch, isn't installed, the tools error out), don't mark test cases as failed or blocked. \
@@ -107,4 +108,27 @@ Return a structured JSON report:
   "environment_error": null
 }}
 ```
+"""
+
+
+RECORDING_INSTRUCTIONS = """\
+## Recording
+These tests are being recorded, so they can later be replayed as scripts without AI. Every test \
+must stand on its own, and you mark its parts with the `argus` tools:
+
+1. Call `start_test` with the test ID.
+2. Reset the browser so the test starts fresh: call `browser_run_code_unsafe` with exactly \
+`async (page) => { try { await page.evaluate(() => { localStorage.clear(); sessionStorage.clear(); }); } catch {} \
+await page.context().clearCookies(); await page.goto('about:blank'); }`
+3. If the test has preconditions (e.g. "Logged in as member"), call `start_step` with step 0 and do \
+what they need, even if an earlier test already did (for example, log in again).
+4. Before each step's actions, call `start_step` with the test ID and the step number from the plan.
+5. Call `check` for each acceptance criterion **at the moment you confirm it**, while the page still \
+shows it, not in a batch at the end: a script replays each check at the point where you called it. \
+For example, "the login form is shown" must be checked before you log in. Choose what a script can \
+verify most reliably: `text_visible` (exact text you saw on the page, such as a message or heading), \
+`element_visible` (a role and accessible name, such as button "Logout"), `url_contains` (part of the \
+URL, such as "/secure"), `field_value` (a field's label and value), or `text_hidden` (text that must \
+not be shown). Use `manual` only when a criterion needs human judgement, such as "the layout looks \
+right". Don't call `check` for criteria that don't hold.
 """

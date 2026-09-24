@@ -349,3 +349,83 @@ async def test_models_and_ai_report_flow_through(client, monkeypatch):
         await _finished(client, fancy["id"])
     assert plain["models"] == ["claude-sonnet-5"]
     assert [k["ai_report"] for k in seen] == [False, True]
+
+
+# ── recorded scripts ─────────────────────────────────────────
+
+
+async def test_suite_runs_record_and_reuse_scripts(client, monkeypatch):
+    calls = []
+
+    async def execute_plan(plan, url, run_dir, **kwargs):
+        calls.append({"ids": [tc.id for tc in plan.cases], **kwargs})
+        results = [{"id": tc.id, "status": "passed", "mode": "ai"} for tc in plan.cases]
+        merged = merge_results([json.dumps({"results": results})], plan)
+        recorded = {tc.id: f"// script for {tc.id}\n" for tc in plan.cases if tc.id == "TC-001"}
+        return RunResult(run_dir, run_dir / "report.md", merged, [], cost_usd=0.1, recorded=recorded)
+
+    monkeypatch.setattr(server, "execute_plan", execute_plan)
+    async with client:
+        await client.post("/projects", json=PROJECT)
+        await client.post("/projects/looma/suites", json={"name": "Smoke", "plan": SUITE_PLAN})
+
+        first = (await client.post("/projects/looma/suites/smoke/run", json={"mode": "ai"})).json()
+        assert first["mode"] == "ai"
+        await _finished(client, first["id"])
+        assert calls[0]["record"] is True and calls[0]["scripts"] == {} and calls[0]["mode"] == "ai"
+
+        suite = (await client.get("/projects/looma/suites/smoke")).json()
+        assert [t["script"]["status"] for t in suite["tests"]] == ["ready", "none"]
+        assert suite["scripts_ready"] == 1
+        script = await client.get("/projects/looma/suites/smoke/scripts/TC-001")
+        assert script.text == "// script for TC-001\n"
+
+        second = (await client.post("/projects/looma/suites/smoke/run", json={})).json()
+        assert second["mode"] == "auto"
+        await _finished(client, second["id"])
+        assert list(calls[1]["scripts"]) == ["TC-001"] and calls[1]["mode"] == "auto"
+
+        # Editing a test makes its script outdated, so it isn't replayed
+        edited = SUITE_PLAN.replace("1. Log in as retailer", "1. Log in as retailer\n2. Open the dashboard")
+        await client.put("/projects/looma/suites/smoke", json={"name": "Smoke", "plan": edited})
+        suite = (await client.get("/projects/looma/suites/smoke")).json()
+        assert suite["tests"][0]["script"]["status"] == "outdated"
+        third = (await client.post("/projects/looma/suites/smoke/run", json={"mode": "script"})).json()
+        await _finished(client, third["id"])
+        assert calls[2]["scripts"] == {} and calls[2]["mode"] == "script"
+
+        rerun = (await client.post(f"/runs/{third['id']}/rerun", json={"failed_only": False})).json()
+        assert rerun["mode"] == "script" and rerun["suite"] == "smoke"
+        await _finished(client, rerun["id"])
+
+        assert (await client.delete("/projects/looma/suites/smoke/scripts/TC-001")).status_code == 204
+        assert (await client.get("/projects/looma/suites/smoke/scripts/TC-001")).status_code == 404
+        assert (await client.post("/projects/looma/suites/smoke/run", json={"mode": "turbo"})).status_code == 422
+
+
+async def test_quick_tests_never_record(client, monkeypatch):
+    calls = []
+
+    async def execute_plan(plan, url, run_dir, **kwargs):
+        calls.append(kwargs)
+        merged = merge_results([json.dumps({"results": [{"id": "TC-001", "status": "passed"}]})], plan)
+        return RunResult(run_dir, run_dir / "report.md", merged, [], cost_usd=0.1)
+
+    monkeypatch.setattr(server, "execute_plan", execute_plan)
+    async with client:
+        await client.post("/projects", json=PROJECT)
+        run = (await client.post("/runs", json={"project": "looma", "scenario": "x"})).json()
+        await _finished(client, run["id"])
+    assert run["mode"] == "ai"
+    assert calls[0]["record"] is False and calls[0]["mode"] == "ai"
+
+
+async def test_deleting_a_suite_deletes_its_scripts(client, fakes, tmp_path):
+    async with client:
+        await client.post("/projects", json=PROJECT)
+        await client.post("/projects/looma/suites", json={"name": "Smoke", "plan": SUITE_PLAN})
+        scripts_dir = tmp_path / "suites" / "looma" / "smoke.scripts"
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / "TC-001.mjs").write_text("//")
+        await client.delete("/projects/looma/suites/smoke")
+    assert not scripts_dir.exists()

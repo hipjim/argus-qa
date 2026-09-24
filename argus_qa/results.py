@@ -100,9 +100,7 @@ def merge_results(raw_outputs: list[str], plan: TestPlan) -> dict:
     # Anything reported that wasn't in the plan is kept, but not counted
     extra = list(by_id.values())
 
-    summary = {"total": len(results), **{s: 0 for s in STATUSES}}
-    for r in results:
-        summary[r["status"]] += 1
+    summary = summarize(results)
 
     merged = {
         "summary": summary,
@@ -117,6 +115,45 @@ def merge_results(raw_outputs: list[str], plan: TestPlan) -> dict:
     if environment_errors:
         merged["environment_errors"] = environment_errors
     return merged
+
+
+def summarize(results: list[dict]) -> dict:
+    """Counts by status, and (for runs that replayed scripts) how each test was run."""
+    summary = {"total": len(results), **{s: 0 for s in STATUSES}}
+    for r in results:
+        summary[r["status"]] += 1
+    if any(r.get("mode") for r in results):
+        summary["by_script"] = sum(1 for r in results if r.get("mode") == "script")
+        summary["by_ai"] = sum(1 for r in results if r.get("mode") == "ai")
+        summary["healed"] = sum(1 for r in results if r.get("healed"))
+    return summary
+
+
+def script_result(case: TestCase, replayed: dict) -> dict:
+    """A results entry for a test replayed from its script."""
+    steps = [
+        {"step": s.get("text") or f"Step {s.get('step')}", "expected": "",
+         "actual": "Done" if s.get("status") == "passed" else s.get("error", "Failed"),
+         "status": s.get("status"), "screenshot": s.get("screenshot")}
+        for s in replayed.get("steps", [])
+    ]
+    steps += [
+        {"step": "Check", "expected": c.get("criterion", ""),
+         "actual": "As expected" if c.get("status") == "passed" else c.get("error", "Not as expected"),
+         "status": c.get("status"), "screenshot": c.get("screenshot")}
+        for c in replayed.get("checks", [])
+    ]
+    passed = replayed.get("status") == "passed"
+    where = f"step {replayed['failed_step']}" if replayed.get("failed_step") is not None else "a check"
+    return {
+        "id": case.id,
+        "name": case.name,
+        "status": "passed" if passed else "failed",
+        "mode": "script",
+        "duration_ms": replayed.get("duration_ms"),
+        "steps": steps,
+        "notes": "" if passed else f"Failed at {where}: {replayed.get('error') or 'unknown error'}",
+    }
 
 
 def failed_ids(results: dict) -> list[str]:

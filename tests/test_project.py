@@ -130,7 +130,7 @@ async def test_execute_plan_uses_project_and_never_saves_secrets(project, tmp_pa
     """Tester gets real credentials; results, report, and the reporter's prompt never contain them."""
     prompts = []
 
-    async def fake_agent(prompt, options, label="", redact=None):
+    async def fake_agent(prompt, options, label="", redact=None, **_):
         prompts.append((label, prompt))
         if label == "reporter":
             text = "# Report\nAdmin logged in with admin-secret-9."
@@ -189,7 +189,7 @@ SCAFFOLD = "# Test Plan: X\n\n### TC-001: Promotions list loads\n\n**Priority:**
 async def test_discover_app(project, tmp_path, monkeypatch):
     seen = []
 
-    async def fake_agent(prompt, options, label="", redact=None):
+    async def fake_agent(prompt, options, label="", redact=None, **_):
         seen.append((label, prompt, options))
         if label == "scaffold":
             return orchestrator.AgentRun(text=SCAFFOLD, ok=True, cost_usd=0.1)
@@ -236,7 +236,7 @@ async def test_explore_app_turns_bugs_into_tests(project, tmp_path, monkeypatch)
     }
     prompts = []
 
-    async def fake_agent(prompt, options, label="", redact=None):
+    async def fake_agent(prompt, options, label="", redact=None, **_):
         prompts.append((prompt, options))
         text = json.dumps(report)
         return orchestrator.AgentRun(text=redact(text) if redact else text, ok=True, cost_usd=0.4)
@@ -276,7 +276,7 @@ def test_budget_split_for_test_runs():
 async def test_default_report_needs_no_model_call(tmp_path, monkeypatch):
     calls = []
 
-    async def fake_agent(prompt, options, label="", redact=None):
+    async def fake_agent(prompt, options, label="", redact=None, **_):
         calls.append((label, options))
         text = json.dumps({"results": [
             {"id": "TC-001", "name": "Login", "status": "passed"},
@@ -327,7 +327,7 @@ async def test_session_agents_get_role_models(project, tmp_path, monkeypatch):
         monkeypatch.delenv(var, raising=False)
     seen = {}
 
-    async def fake_agent(prompt, options, label="", redact=None):
+    async def fake_agent(prompt, options, label="", redact=None, **_):
         seen[label] = options
         if label == "scaffold":
             return orchestrator.AgentRun(text=SCAFFOLD, ok=True, models=["claude-sonnet-5"])
@@ -361,7 +361,7 @@ def test_tester_snapshot_mode(monkeypatch):
 async def test_tester_prompt_explains_page_reading(tmp_path, monkeypatch):
     prompts = []
 
-    async def fake_agent(prompt, options, label="", redact=None):
+    async def fake_agent(prompt, options, label="", redact=None, **_):
         prompts.append(prompt)
         return orchestrator.AgentRun(text=json.dumps({"results": [{"id": "TC-001", "status": "passed"}]}), ok=True)
 

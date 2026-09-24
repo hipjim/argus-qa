@@ -179,6 +179,17 @@ class Project:
         values = [c.password for c in self.credentials.values()] + list(self.secrets.values())
         return [v for v in values if v]
 
+    def placeholder_values(self) -> dict[str, str]:
+        """Every {{name}} this project defines, with its value."""
+        values = {}
+        for role, cred in self.credentials.items():
+            values[f"{role}.username"] = cred.username
+            values[f"{role}.password"] = cred.password
+        return {**values, **self.variables, **self.secrets}
+
+    def secret_placeholders(self) -> set[str]:
+        return {f"{role}.password" for role in self.credentials} | set(self.secrets)
+
     def lookup(self, name: str) -> str | None:
         """Resolve a {{placeholder}} name: role.username / role.password / variable / secret."""
         if "." in name:
