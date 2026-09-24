@@ -43,14 +43,16 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
 from argus_qa import colors as c
-from argus_qa.agents.orchestrator import discover_app, execute_plan, explore_app
+from argus_qa.agents.orchestrator import discover_app, draft_test_case, execute_plan, explore_app
 from argus_qa.events import EventLog, capture
 from argus_qa.plan_parser import (
     TestPlan,
     append_cases,
     compose_plan,
     parse_test_plan,
+    plan_fields,
     plan_from_scenario,
+    render_plan,
 )
 from argus_qa.project import MASK, Project, slugify, substitute
 
@@ -178,6 +180,33 @@ class AcceptRequest(BaseModel):
 
 class DeleteRunsRequest(BaseModel):
     ids: list[str] = Field(min_length=1, max_length=500, description="Run IDs to delete.")
+
+
+class CaseFields(BaseModel):
+    id: str | None = None
+    title: str = ""
+    priority: str = ""
+    category: str = ""
+    preconditions: list[str] = []
+    steps: list[str] = []
+    expected: list[str] = Field([], description="Acceptance criteria.")
+    notes: str = ""
+
+
+class PlanFields(BaseModel):
+    title: str = ""
+    url: str | None = None
+    notes: str = Field("", description="Free-form text before the test cases (setup, credentials...).")
+    cases: list[CaseFields] = []
+
+
+class ParseRequest(BaseModel):
+    plan: str
+
+
+class DraftRequest(BaseModel):
+    description: str = Field(min_length=3, max_length=2000)
+    project: str | None = None
 
 
 class RerunRequest(BaseModel):
@@ -714,6 +743,28 @@ def create_app(data_dir: str | Path = "argus-data", max_concurrent: int = 2) -> 
                        callback_url=body.callback_url),
             suite=suite.slug, title=suite.name,
         )
+
+    # ── editing helpers ──────────────────────────────────────
+
+    @api.post("/plans/parse")
+    async def parse_plan(body: ParseRequest) -> PlanFields:
+        """Split a Markdown plan into editable fields (test cases, steps, acceptance criteria)."""
+        return PlanFields.model_validate(plan_fields(body.plan))
+
+    @api.post("/plans/render")
+    async def render(body: PlanFields) -> dict:
+        """Markdown for a plan from editable fields. Keeps test IDs; numbers new cases."""
+        return {"plan": render_plan(body.model_dump())}
+
+    @api.post("/drafts/test-case")
+    async def draft(body: DraftRequest) -> dict:
+        """Draft a test case's steps and acceptance criteria from a sentence (uses the writer model)."""
+        project = projects.get(body.project) if body.project else None
+        try:
+            fields, cost_usd = await draft_test_case(body.description, project)
+        except RuntimeError as e:
+            raise HTTPException(422, str(e)) from e
+        return {"case": fields, "cost_usd": round(cost_usd, 4)}
 
     # ── runs ─────────────────────────────────────────────────
 

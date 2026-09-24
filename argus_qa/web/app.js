@@ -385,16 +385,282 @@ async function runsView(params, alive) {
   }, LIST_POLL_MS);
 }
 
+// ── Test case editor ─────────────────────────────────────────────────
+// Edits test cases as fields (title, priority, steps, acceptance criteria…). The server
+// converts to and from Markdown (/plans/parse, /plans/render), which stays the storage format.
+
+const PRIORITIES = ["critical", "high", "medium", "low"];
+const CATEGORIES = ["functional", "usability", "accessibility", "security", "performance"];
+const CASE_LISTS = [
+  { key: "preconditions", label: "Before you start", add: "Add precondition", placeholder: "e.g. Logged in as retailer" },
+  { key: "steps", label: "Steps", add: "Add step", placeholder: "e.g. Click “New promotion”" },
+  { key: "expected", label: "Acceptance criteria", add: "Add criterion", placeholder: "e.g. The promotion appears in the list as Active" },
+];
+
+const emptyCase = () => ({
+  id: null, title: "", priority: "", category: "", preconditions: [], steps: [""], expected: [""], notes: "",
+});
+
+// Lines pasted from a ticket or document: "1. Open", "- Save", "[ ] Check" -> ["Open", "Save", "Check"]
+function splitPasted(text) {
+  return text.split(/\r?\n/)
+    .map((l) => l.replace(/^\s*(?:\d+[.)]|[-*•+]|\[[ xX]\])\s*/, "").trim())
+    .filter(Boolean);
+}
+
+function unknownPlaceholders(text, known) {
+  return [...String(text || "").matchAll(/\{\{\s*([\w.-]+)\s*\}\}/g)].map((m) => m[1]).filter((n) => !known.has(n));
+}
+
+/**
+ * Render an editor for `cases` into `container`.
+ * options: single (one case, no add/remove/reorder), project (slug, for drafting),
+ *          placeholders (names usable as {{name}}), onFocus(el) (last focused field, for inserting values),
+ *          onChange() (after any edit)
+ * Returns { cases() } giving the current state.
+ */
+function caseEditor(container, initial, { single = false, project = null, placeholders = [], onFocus = () => {}, onChange = () => {} } = {}) {
+  let cases = initial.length ? initial.map((c) => ({ ...emptyCase(), ...c })) : [emptyCase()];
+  const known = new Set(placeholders);
+  let drag = null;
+
+  const itemHtml = (list, ci, j, value) => `
+    <div class="tc-item" data-list="${list.key}" data-j="${j}">
+      <span class="tc-marker">${list.key === "steps" ? j + 1 : list.key === "expected" ? "✓" : "•"}</span>
+      <input class="tc-input" value="${esc(value)}" placeholder="${esc(list.placeholder)}" aria-label="${esc(list.label)} ${j + 1}">
+      <span class="tc-grip" draggable="true" title="Drag to reorder" aria-hidden="true">⋮⋮</span>
+      <button type="button" class="tc-x" data-remove-item title="Remove">✕</button>
+    </div>`;
+
+  const cardHtml = (c, ci) => `
+    <article class="tc-card" data-ci="${ci}">
+      <header class="tc-head">
+        ${single ? "" : `<span class="tc-grip tc-card-grip" draggable="true" title="Drag to reorder test cases">⋮⋮</span>`}
+        <span class="case-id">${esc(c.id || "new")}</span>
+        <input class="tc-title" value="${esc(c.title)}" placeholder="What does this test check?" aria-label="Test title">
+        <select class="tc-priority" aria-label="Priority"><option value="">Priority</option>
+          ${PRIORITIES.map((p) => `<option ${c.priority === p ? "selected" : ""}>${p}</option>`).join("")}</select>
+        <select class="tc-category" aria-label="Category"><option value="">Category</option>
+          ${CATEGORIES.map((p) => `<option ${c.category === p ? "selected" : ""}>${p}</option>`).join("")}</select>
+        ${single ? "" : `<button type="button" class="tc-x" data-remove-case title="Remove test case">✕</button>`}
+      </header>
+      <div class="tc-draft">
+        <input class="tc-draft-input" placeholder="Describe the test in a sentence and let AI draft the steps, e.g. “Retailer creates a 10% promotion and sees it listed as active”">
+        <button type="button" class="btn btn-small" data-draft>Draft steps</button>
+      </div>
+      ${CASE_LISTS.map((list) => `
+        <section class="tc-list" data-list="${list.key}">
+          <h4>${list.label}</h4>
+          <div class="tc-items">${c[list.key].map((v, j) => itemHtml(list, ci, j, v)).join("")}</div>
+          <button type="button" class="tc-add" data-add="${list.key}">+ ${list.add}</button>
+        </section>`).join("")}
+      <details class="tc-notes" ${c.notes ? "open" : ""}>
+        <summary>Notes</summary>
+        <textarea class="tc-notes-input" rows="2" placeholder="Anything else the tester should know">${esc(c.notes)}</textarea>
+      </details>
+    </article>`;
+
+  const draw = (focus) => {
+    container.innerHTML = cases.map(cardHtml).join("")
+      + (single ? "" : `<button type="button" class="btn btn-small tc-add-case" data-add-case>+ Add test case</button>`);
+    container.querySelectorAll(".tc-input, .tc-title, .tc-notes-input").forEach(checkPlaceholders);
+    if (focus) {
+      const el = container.querySelector(focus);
+      if (el) { el.focus(); el.setSelectionRange?.(el.value.length, el.value.length); }
+    }
+    onChange();
+  };
+
+  const checkPlaceholders = (el) => {
+    const missing = known.size || project ? unknownPlaceholders(el.value, known) : [];
+    el.classList.toggle("warn", missing.length > 0);
+    el.title = missing.length ? `Not a value in this project: ${missing.map((m) => `{{${m}}}`).join(", ")}` : "";
+  };
+
+  const where = (el) => {
+    const card = el.closest(".tc-card");
+    const item = el.closest(".tc-item");
+    return {
+      ci: card ? Number(card.dataset.ci) : -1,
+      list: item?.dataset.list || el.closest(".tc-list")?.dataset.list,
+      j: item ? Number(item.dataset.j) : -1,
+    };
+  };
+  const itemSelector = (ci, list, j) => `.tc-card[data-ci="${ci}"] .tc-item[data-list="${list}"][data-j="${j}"] input`;
+
+  // Typing updates state in place, so focus and cursor stay put
+  container.addEventListener("input", (e) => {
+    const { ci, list, j } = where(e.target);
+    if (ci < 0) return;
+    const c = cases[ci];
+    if (e.target.classList.contains("tc-input")) c[list][j] = e.target.value;
+    else if (e.target.classList.contains("tc-title")) c.title = e.target.value;
+    else if (e.target.classList.contains("tc-notes-input")) c.notes = e.target.value;
+    checkPlaceholders(e.target);
+    onChange();
+  });
+  container.addEventListener("change", (e) => {
+    const { ci } = where(e.target);
+    if (e.target.classList.contains("tc-priority")) cases[ci].priority = e.target.value;
+    if (e.target.classList.contains("tc-category")) cases[ci].category = e.target.value;
+  });
+  container.addEventListener("focusin", (e) => {
+    if (e.target.matches(".tc-input, .tc-title, .tc-notes-input")) onFocus(e.target);
+  });
+
+  container.addEventListener("keydown", (e) => {
+    if (!e.target.classList.contains("tc-input")) return;
+    const { ci, list, j } = where(e.target);
+    const items = cases[ci][list];
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const at = e.target.selectionStart ?? e.target.value.length;
+      const rest = items[j].slice(at);
+      items[j] = items[j].slice(0, at);
+      items.splice(j + 1, 0, rest);
+      draw(itemSelector(ci, list, j + 1));
+      container.querySelector(itemSelector(ci, list, j + 1))?.setSelectionRange(0, 0);
+    } else if (e.key === "Backspace" && e.target.value === "" && items.length > 0) {
+      e.preventDefault();
+      items.splice(j, 1);
+      draw(j > 0 ? itemSelector(ci, list, j - 1) : `.tc-card[data-ci="${ci}"] .tc-title`);
+    } else if ((e.key === "ArrowDown" || e.key === "ArrowUp") && !e.shiftKey) {
+      const next = container.querySelector(itemSelector(ci, list, j + (e.key === "ArrowDown" ? 1 : -1)));
+      if (next) { e.preventDefault(); next.focus(); }
+    }
+  });
+
+  container.addEventListener("paste", (e) => {
+    if (!e.target.classList.contains("tc-input")) return;
+    const lines = splitPasted(e.clipboardData.getData("text"));
+    if (lines.length < 2) return;
+    e.preventDefault();
+    const { ci, list, j } = where(e.target);
+    const items = cases[ci][list];
+    const head = items[j].trim() ? [items[j]] : [];
+    items.splice(j, 1, ...head, ...lines);
+    draw(itemSelector(ci, list, j + head.length + lines.length - 1));
+  });
+
+  container.addEventListener("click", async (e) => {
+    const t = e.target;
+    const { ci, list, j } = where(t);
+    if (t.closest("[data-add]")) {
+      const key = t.closest("[data-add]").dataset.add;
+      cases[ci][key].push("");
+      draw(itemSelector(ci, key, cases[ci][key].length - 1));
+    } else if (t.closest("[data-remove-item]")) {
+      cases[ci][list].splice(j, 1);
+      draw();
+    } else if (t.closest("[data-remove-case]")) {
+      const c = cases[ci];
+      const filled = c.title || [...c.steps, ...c.expected, ...c.preconditions].some((v) => v.trim());
+      if (filled && !confirm(`Remove “${c.title || "this test case"}”?`)) return;
+      cases.splice(ci, 1);
+      if (!cases.length) cases.push(emptyCase());
+      draw();
+    } else if (t.closest("[data-add-case]")) {
+      cases.push(emptyCase());
+      draw(`.tc-card[data-ci="${cases.length - 1}"] .tc-title`);
+    } else if (t.closest("[data-draft]")) {
+      const input = t.closest(".tc-draft").querySelector(".tc-draft-input");
+      const description = input.value.trim() || cases[ci].title.trim();
+      if (description.length < 3) { input.focus(); toast("Describe the test in a sentence first", true); return; }
+      const c = cases[ci];
+      const hasWork = [...c.steps, ...c.expected, ...c.preconditions].some((v) => v.trim());
+      if (hasWork && !confirm("Replace this test's steps and acceptance criteria with a draft?")) return;
+      t.disabled = true;
+      t.textContent = "Drafting…";
+      try {
+        const res = await api("/drafts/test-case", { method: "POST", body: { description, ...(project ? { project } : {}) } });
+        cases[ci] = { ...res.case, id: c.id, notes: c.notes };
+        if (!cases[ci].steps.length) cases[ci].steps = [""];
+        if (!cases[ci].expected.length) cases[ci].expected = [""];
+        draw();
+        toast(`Drafted — review and edit it (cost ${cost(res.cost_usd)})`);
+      } catch (ex) {
+        toast(ex.message, true);
+        t.disabled = false;
+        t.textContent = "Draft steps";
+      }
+    }
+  });
+
+  // Drag and drop: steps/criteria within their list, and whole cards
+  container.addEventListener("dragstart", (e) => {
+    const grip = e.target.closest(".tc-grip");
+    if (!grip) return;
+    const { ci, list, j } = where(grip);
+    drag = grip.classList.contains("tc-card-grip") ? { card: ci } : { ci, list, j };
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", "");
+    (grip.closest(".tc-item") || grip.closest(".tc-card")).classList.add("dragging");
+  });
+  container.addEventListener("dragend", () => {
+    drag = null;
+    container.querySelectorAll(".dragging, .drop-before, .drop-after").forEach((el) => el.classList.remove("dragging", "drop-before", "drop-after"));
+  });
+  const dropTarget = (e) => {
+    if (!drag) return null;
+    const el = drag.card !== undefined ? e.target.closest(".tc-card") : e.target.closest(`.tc-card[data-ci="${drag.ci}"] .tc-item[data-list="${drag.list}"]`);
+    if (!el) return null;
+    const box = el.getBoundingClientRect();
+    return { el, after: e.clientY > box.top + box.height / 2 };
+  };
+  container.addEventListener("dragover", (e) => {
+    const target = dropTarget(e);
+    if (!target) return;
+    e.preventDefault();
+    container.querySelectorAll(".drop-before, .drop-after").forEach((el) => el.classList.remove("drop-before", "drop-after"));
+    target.el.classList.add(target.after ? "drop-after" : "drop-before");
+  });
+  container.addEventListener("drop", (e) => {
+    const target = dropTarget(e);
+    if (!target) return;
+    e.preventDefault();
+    const move = (arr, from, to) => { const [x] = arr.splice(from, 1); arr.splice(from < to ? to - 1 : to, 0, x); };
+    if (drag.card !== undefined) {
+      const to = Number(target.el.dataset.ci) + (target.after ? 1 : 0);
+      move(cases, drag.card, to);
+    } else {
+      const to = Number(target.el.dataset.j) + (target.after ? 1 : 0);
+      move(cases[drag.ci][drag.list], drag.j, to);
+    }
+    drag = null;
+    draw();
+  });
+
+  draw();
+  return {
+    cases: () => cases.map((c) => ({ ...c, preconditions: c.preconditions.filter((v) => v.trim()),
+      steps: c.steps.filter((v) => v.trim()), expected: c.expected.filter((v) => v.trim()) })),
+  };
+}
+
+// Chips that insert {{name}} into whichever field was focused last
+function placeholderChips(target, names, getField) {
+  target.innerHTML = names.map((v) => `<button type="button" class="chip" data-insert="${esc(v)}">{{${esc(v)}}}</button>`).join("");
+  target.onclick = (e) => {
+    const chip = e.target.closest("[data-insert]");
+    const field = getField();
+    if (!chip || !field) return;
+    const text = `{{${chip.dataset.insert}}}`;
+    const at = field.selectionStart ?? field.value.length;
+    field.value = field.value.slice(0, at) + text + field.value.slice(field.selectionEnd ?? at);
+    field.dispatchEvent(new Event("input", { bubbles: true }));
+    field.focus();
+    field.selectionStart = field.selectionEnd = at + text.length;
+  };
+}
+
+function projectPlaceholders(p) {
+  return p ? [
+    ...Object.keys(p.credentials).flatMap((role) => [`${role}.username`, `${role}.password`]),
+    ...Object.keys(p.variables), ...Object.keys(p.secrets),
+  ] : [];
+}
+
 // ── New run ──────────────────────────────────────────────────────────
-
-const SCENARIO_EXAMPLE = `**Steps:**
-1. Log in as admin
-2. Open Settings → Team
-3. Invite a new member with a unique email
-
-**Expected result:**
-- The invite appears in the pending list
-- A success message is shown`;
 
 async function newRunView(params, alive) {
   const projects = await api("/projects");
@@ -431,14 +697,7 @@ async function newRunView(params, alive) {
         </div>
       </div>
 
-      <div id="mode-scenario" class="form" style="gap:16px">
-        <label class="field"><span>Name</span>
-          <input name="name" placeholder="Admin can invite a team member" autocomplete="off">
-        </label>
-        <label class="field"><span>Steps and expected result</span>
-          <textarea name="scenario" rows="7" placeholder="${esc(SCENARIO_EXAMPLE)}"></textarea>
-        </label>
-      </div>
+      <div id="mode-scenario" class="tc-editor"></div>
 
       <div id="mode-plan" class="form" style="gap:16px" hidden>
         <label class="field"><span>Test plan (Markdown)</span>
@@ -483,9 +742,17 @@ async function newRunView(params, alive) {
   const form = view.querySelector("#run-form");
   const byName = Object.fromEntries(projects.map((p) => [p.slug, p]));
   let mode = "scenario";
-  let lastFocused = form.elements.scenario;
+  let lastFocused = null;
+  let scenario = null;
 
-  form.querySelectorAll("textarea").forEach((t) => t.addEventListener("focus", () => { lastFocused = t; }));
+  form.elements.plan.addEventListener("focus", (e) => { lastFocused = e.target; });
+  const buildScenarioEditor = () => {
+    const slug = form.elements.project.value || null;
+    scenario = caseEditor(view.querySelector("#mode-scenario"), scenario ? scenario.cases() : [], {
+      single: true, project: slug, placeholders: projectPlaceholders(byName[slug]),
+      onFocus: (el) => { lastFocused = el; },
+    });
+  };
 
   let suites = [];
   const setMode = (next) => {
@@ -495,7 +762,7 @@ async function newRunView(params, alive) {
     view.querySelector("#mode-plan").hidden = mode !== "plan";
     view.querySelector("#mode-suite").hidden = mode !== "suite";
     view.querySelector("#placeholders").classList.toggle("off", mode === "suite");
-    lastFocused = mode === "plan" ? form.elements.plan : form.elements.scenario;
+    lastFocused = mode === "plan" ? form.elements.plan : null;
   };
   const syncSuites = async () => {
     const slug = form.elements.project.value;
@@ -516,26 +783,13 @@ async function newRunView(params, alive) {
     const p = byName[form.elements.project.value];
     form.elements.url.placeholder = p?.url || "https://staging.example.com";
     view.querySelector("#url-hint").textContent = p?.url ? "Leave empty to use the project's URL." : "";
-    const values = p ? [
-      ...Object.keys(p.credentials).flatMap((role) => [`${role}.username`, `${role}.password`]),
-      ...Object.keys(p.variables), ...Object.keys(p.secrets),
-    ] : [];
+    const values = projectPlaceholders(p);
     view.querySelector("#placeholders").hidden = !values.length;
-    view.querySelector("#placeholder-chips").innerHTML = values.map((v) => `<button type="button" class="chip" data-insert="${esc(v)}">{{${esc(v)}}}</button>`).join("");
+    placeholderChips(view.querySelector("#placeholder-chips"), values, () => lastFocused);
+    buildScenarioEditor();
   };
   form.elements.project.addEventListener("change", syncProject);
   syncProject();
-
-  view.querySelector("#placeholder-chips").addEventListener("click", (e) => {
-    const chip = e.target.closest("[data-insert]");
-    if (!chip) return;
-    const t = lastFocused;
-    const text = `{{${chip.dataset.insert}}}`;
-    const at = t.selectionStart ?? t.value.length;
-    t.value = t.value.slice(0, at) + text + t.value.slice(t.selectionEnd ?? at);
-    t.focus();
-    t.selectionStart = t.selectionEnd = at + text.length;
-  });
 
   view.querySelectorAll("[data-mode]").forEach((b) => b.addEventListener("click", () => setMode(b.dataset.mode)));
 
@@ -569,8 +823,22 @@ async function newRunView(params, alive) {
       endpoint = `/projects/${encodeURIComponent(f.project.value)}/suites/${encodeURIComponent(f.suite.value)}/run`;
       delete body.project;
     } else if (mode === "scenario") {
-      body.scenario = f.scenario.value;
-      if (f.name.value.trim()) body.name = f.name.value.trim();
+      const [test] = scenario.cases();
+      if (!test.steps.length) {
+        err.textContent = "Add at least one step, or describe the test in a sentence and click “Draft steps”.";
+        err.hidden = false;
+        return;
+      }
+      const title = test.title.trim() || "Scenario";
+      try {
+        body.plan = (await api("/plans/render", {
+          method: "POST", body: { title, cases: [{ ...test, title }] },
+        })).plan;
+      } catch (ex) {
+        err.textContent = ex.message;
+        err.hidden = false;
+        return;
+      }
     } else {
       body.plan = f.plan.value;
       const only = f.only.value.split(",").map((s) => s.trim()).filter(Boolean);
@@ -589,7 +857,7 @@ async function newRunView(params, alive) {
       btn.textContent = "Start run";
     }
   });
-  (form.elements.project.value ? form.elements.name : form.elements.url).focus();
+  view.querySelector(form.elements.project.value ? "#mode-scenario .tc-title" : 'input[name="url"]')?.focus();
 }
 
 // ── Run detail ───────────────────────────────────────────────────────
@@ -1334,20 +1602,6 @@ function projectSettingsForm(container, project, isNew) {
 
 // ── Suites ───────────────────────────────────────────────────────────
 
-const SUITE_EXAMPLE = `### TC-001: Retailer can log in
-
-**Priority:** critical
-
-**Steps:**
-1. Log in as retailer
-
-**Expected result:**
-- The dashboard is shown
-
----
-
-### TC-002: …`;
-
 async function suiteView(slug, suiteSlug, alive) {
   const isNew = !suiteSlug;
   const [project, suite, runs] = await Promise.all([
@@ -1356,7 +1610,12 @@ async function suiteView(slug, suiteSlug, alive) {
     isNew ? [] : api(`/runs?project=${encodeURIComponent(slug)}&suite=${encodeURIComponent(suiteSlug)}&limit=10`),
   ]);
   if (!alive()) return;
+  let plan = isNew
+    ? { title: "", url: project.url || null, notes: "", cases: [] }
+    : await api("/plans/parse", { method: "POST", body: { plan: suite.plan } });
+  if (!alive()) return;
   const base = `#/projects/${encodeURIComponent(slug)}`;
+  const placeholders = projectPlaceholders(project);
 
   view.innerHTML = `
     <a class="crumb" href="${base}">← ${esc(project.name)}</a>
@@ -1369,12 +1628,23 @@ async function suiteView(slug, suiteSlug, alive) {
       </div>`}
     </div>
     <div class="run-grid ${runs.length ? "" : "no-feed"}">
-      <form class="form" id="suite-form" novalidate>
-        <label class="field"><span>Name</span><input name="name" required value="${esc(suite?.name || "")}" placeholder="Smoke tests"></label>
-        <label class="field"><span>Test cases (Markdown)</span>
-          <textarea name="plan" rows="22" placeholder="${esc(SUITE_EXAMPLE)}">${esc(suite?.plan || "")}</textarea>
+      <form class="form suite-form" id="suite-form" novalidate>
+        <label class="field"><span>Suite name</span><input name="name" required value="${esc(suite?.name || "")}" placeholder="Smoke tests"></label>
+        <div class="suite-toolbar">
+          <div class="segmented" role="group" aria-label="Editing mode">
+            <button type="button" data-edit-mode="fields" aria-pressed="true">Editor</button>
+            <button type="button" data-edit-mode="markdown" aria-pressed="false">Markdown</button>
+          </div>
           <span class="detected" id="detected"></span>
-        </label>
+        </div>
+        ${placeholders.length ? `<div class="field values-bar"><span>Project values <span class="muted">— click to insert into the field you're editing</span></span>
+          <div class="chips" id="suite-chips"></div></div>` : ""}
+        <div id="cases" class="tc-editor"></div>
+        <textarea name="plan" rows="26" hidden aria-label="Suite as Markdown"></textarea>
+        <details class="plan-notes" id="plan-notes" ${plan.notes ? "open" : ""}>
+          <summary>Setup notes</summary>
+          <textarea name="notes" rows="4" placeholder="Anything that applies to every test: setup steps, feature flags, test data…">${esc(plan.notes || "")}</textarea>
+        </details>
         <p class="form-error" id="form-error" hidden></p>
         <div class="form-actions sticky-actions">
           <button class="btn btn-primary" type="submit">${isNew ? "Create suite" : "Save changes"}</button>
@@ -1391,22 +1661,71 @@ async function suiteView(slug, suiteSlug, alive) {
     </div>`;
 
   const form = view.querySelector("#suite-form");
-  const detect = () => {
-    const ids = [...form.elements.plan.value.matchAll(/^###\s+(TC-\d+)\s*:\s*(.+)$/gm)].map((m) => m[1]);
-    view.querySelector("#detected").innerHTML = form.elements.plan.value.trim()
-      ? (ids.length ? `<b>${ids.length}</b> test case${ids.length === 1 ? "" : "s"}: ${esc(ids.join(", "))}`
-        : "No test cases found. Each needs a heading like <b>### TC-001: Title</b>.")
-      : "";
+  const $ = (sel) => view.querySelector(sel);
+  let mode = "fields";
+  let editor = null;
+  let lastField = null;
+
+  const countCases = () => {
+    const n = mode === "fields"
+      ? editor.cases().filter((c) => c.title.trim() || c.steps.length).length
+      : [...form.elements.plan.value.matchAll(/^###\s+TC-\d+\s*:/gm)].length;
+    $("#detected").textContent = `${n} test case${n === 1 ? "" : "s"}`;
   };
-  form.elements.plan.addEventListener("input", detect);
-  detect();
+  const showEditor = () => {
+    editor = caseEditor($("#cases"), plan.cases, {
+      project: slug, placeholders, onFocus: (el) => { lastField = el; }, onChange: () => editor && countCases(),
+    });
+    countCases();
+  };
+  const currentPlan = () => ({
+    title: form.elements.name.value.trim() || plan.title || "Untitled",
+    url: plan.url,
+    notes: form.elements.notes.value,
+    cases: editor.cases().filter((c) => c.title.trim() || c.steps.length || c.expected.length),
+  });
+  const setMode = async (next) => {
+    if (next === mode) return;
+    try {
+      if (next === "markdown") {
+        form.elements.plan.value = (await api("/plans/render", { method: "POST", body: currentPlan() })).plan;
+      } else {
+        plan = await api("/plans/parse", { method: "POST", body: { plan: form.elements.plan.value } });
+        form.elements.notes.value = plan.notes || "";
+      }
+    } catch (ex) {
+      toast(ex.message, true);
+      return;
+    }
+    mode = next;
+    view.querySelectorAll("[data-edit-mode]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.editMode === mode)));
+    $("#cases").hidden = mode !== "fields";
+    $("#plan-notes").hidden = mode !== "fields";
+    form.elements.plan.hidden = mode !== "markdown";
+    if (mode === "fields") showEditor(); else countCases();
+  };
+  view.querySelectorAll("[data-edit-mode]").forEach((b) => b.addEventListener("click", () => setMode(b.dataset.editMode)));
+  form.elements.plan.addEventListener("input", countCases);
+  form.elements.plan.addEventListener("focus", (e) => { lastField = e.target; });
+  if (placeholders.length) placeholderChips($("#suite-chips"), placeholders, () => lastField);
+  showEditor();
 
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
-    const err = view.querySelector("#form-error");
+    const err = $("#form-error");
     err.hidden = true;
-    const body = { name: form.elements.name.value.trim(), plan: form.elements.plan.value };
     try {
+      let planText;
+      if (mode === "markdown") {
+        planText = form.elements.plan.value;
+      } else {
+        const data = currentPlan();
+        if (!data.cases.length) throw new Error("Add at least one test case with a title and steps.");
+        const untitled = data.cases.filter((c) => !c.title.trim()).length;
+        if (untitled) throw new Error(`${untitled} test case${untitled === 1 ? " has" : "s have"} no title.`);
+        planText = (await api("/plans/render", { method: "POST", body: data })).plan;
+      }
+      const body = { name: form.elements.name.value.trim(), plan: planText };
       const saved = isNew
         ? await api(`/projects/${encodeURIComponent(slug)}/suites`, { method: "POST", body })
         : await api(`/projects/${encodeURIComponent(slug)}/suites/${encodeURIComponent(suiteSlug)}`, { method: "PUT", body });
@@ -1419,11 +1738,11 @@ async function suiteView(slug, suiteSlug, alive) {
     }
   });
 
-  view.querySelector("#run-suite")?.addEventListener("click", async (e) => {
+  $("#run-suite")?.addEventListener("click", async (e) => {
     e.target.disabled = true;
     try {
       const run = await api(`/projects/${encodeURIComponent(slug)}/suites/${encodeURIComponent(suiteSlug)}/run`, {
-        method: "POST", body: { parallel: Number(view.querySelector("#suite-parallel").value) || 1 },
+        method: "POST", body: { parallel: Number($("#suite-parallel").value) || 1 },
       });
       location.hash = `#/runs/${run.id}`;
     } catch (ex) {
@@ -1432,7 +1751,7 @@ async function suiteView(slug, suiteSlug, alive) {
     }
   });
 
-  view.querySelector("#delete-suite")?.addEventListener("click", async () => {
+  $("#delete-suite")?.addEventListener("click", async () => {
     if (!confirm(`Delete the suite “${suite.name}”? Its past runs are kept.`)) return;
     try {
       await api(`/projects/${encodeURIComponent(slug)}/suites/${encodeURIComponent(suiteSlug)}`, { method: "DELETE" });

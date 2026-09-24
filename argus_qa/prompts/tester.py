@@ -26,7 +26,8 @@ standing instructions from the project in every test.
 3. Execute each **Test Case** one by one, in order:
    - Follow the **Steps** exactly as written.
    - At the end of each step, take one screenshot (see above).
-   - Compare what actually happened to the **Expected result**.
+   - Compare what actually happened to the **Expected result** (also called **Acceptance criteria**); \
+every criterion must hold for the test to pass.
    - Record whether the test PASSED, FAILED, or was BLOCKED.
    - If a step fails, take a screenshot with `_fail` in the name, note what went wrong, and continue.
 4. Pay attention to:

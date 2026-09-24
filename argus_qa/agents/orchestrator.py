@@ -30,6 +30,7 @@ from argus_qa.events import describe_tool, emit
 from argus_qa.plan_parser import TestCase, TestPlan, compose_plan, parse_test_plan
 from argus_qa.project import Project, Redactor, substitute
 from argus_qa.prompts.bug_hunter import BUG_HUNTER_PROMPT
+from argus_qa.prompts.drafter import DRAFTER_PROMPT
 from argus_qa.prompts.explorer import EXPLORER_PROMPT
 from argus_qa.prompts.guardrails import GUARDRAILS
 from argus_qa.prompts.reporter import REPORTER_PROMPT
@@ -318,6 +319,55 @@ async def run_analyze(
     print(c.success(f"\n  Test plan saved to {output}\n"))
     print(c.dim(f"  Exploration notes: {run_dir}   Cost: ${result.cost_usd:.2f}"))
     return str(output)
+
+
+# ── Drafting test cases ─────────────────────────────────────────────
+
+DRAFT_MAX_COST_USD = 0.10
+
+
+def _draft_context(project: Project | None) -> str:
+    """What the drafter may know about a project: role and value names, never their values."""
+    if project is None:
+        return "No project: don't use logins or {{placeholders}}."
+    lines = [f"Name: {project.name}"]
+    if project.description:
+        lines.append(f"About: {project.description}")
+    if project.credentials:
+        lines.append("Test account roles: " + ", ".join(project.credentials))
+    names = [*project.variables, *project.secrets]
+    if names:
+        lines.append("Project values: " + ", ".join(names))
+    return "\n".join(lines)
+
+
+async def draft_test_case(description: str, project: Project | None = None) -> tuple[dict, float]:
+    """Draft one test case's fields from a plain-English sentence. Returns (fields, cost)."""
+    run = await _run_agent(
+        prompt=DRAFTER_PROMPT.format(
+            description=description.strip(), project_context=_draft_context(project)
+        ),
+        options=_reasoning_options(max_budget_usd=DRAFT_MAX_COST_USD, model=model_for("writer")),
+        label="drafter",
+    )
+    data = _parse_json(run.text) if run.ok else None
+    if not data:
+        raise RuntimeError("Couldn't draft a test case from that description. Try rephrasing it.")
+
+    def items(key: str) -> list[str]:
+        value = data.get(key) or []
+        return [str(v).strip() for v in (value if isinstance(value, list) else [value]) if str(v).strip()]
+
+    fields = {
+        "title": str(data.get("title") or description).strip()[:120],
+        "priority": str(data.get("priority") or "").lower(),
+        "category": str(data.get("category") or "").lower(),
+        "preconditions": items("preconditions"),
+        "steps": items("steps"),
+        "expected": items("expected"),
+        "notes": "",
+    }
+    return fields, run.cost_usd
 
 
 # ── Discovery & exploration sessions ────────────────────────────────
