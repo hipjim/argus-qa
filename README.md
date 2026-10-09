@@ -20,6 +20,10 @@
 
 ---
 
+<p align="center">
+  <img src="docs/assets/demo.gif" alt="argus-qa running a checkout suite: an AI agent tests each step live, finds a bug in the checkout form, then a re-run replays the passing tests as scripts in about a second each" width="960">
+</p>
+
 argus-qa is a QA tester that never gets bored. Point it at your web app and it will:
 
 - **Explore** the app the way a new user would, and write a test plan for you.
