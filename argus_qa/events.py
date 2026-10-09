@@ -9,6 +9,7 @@ parallel agents started inside capture() report to the same sink.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -46,6 +47,23 @@ _VERBS = {
     "find": "Find",
 }
 
+# Tools that only look (read the page, logs, wait); the feed plays them down next to real actions
+QUIET_TOOLS = {"snapshot", "wait_for", "console_messages", "network_requests", "network_request", "evaluate",
+               "run_code_unsafe", "find", "tabs"}
+
+# Tools that act on one element: without the agent's description, the result's Playwright code names it
+ELEMENT_TOOLS = {"click", "hover", "type", "select_option", "drag", "file_upload"}
+
+_REF = re.compile(r"^[a-z]*\d*e\d+$")  # snapshot refs like "e12" or "f3e46" mean nothing to a reader
+_QUOTED = r"'((?:[^'\\]|\\.)*)'"
+_GET_BY = re.compile(
+    rf"\.getBy(Role|Text|Label|Placeholder|TestId|AltText|Title)\(\s*{_QUOTED}"
+    rf"(?:\s*,\s*\{{[^}}]*?name:\s*{_QUOTED})?"
+)
+_LOCATOR = re.compile(rf"\.locator\(\s*{_QUOTED}")
+# The code Playwright MCP reports for each browser action
+CODE_BLOCK = re.compile(r"### Ran Playwright code\s*```(?:js|javascript|ts|typescript)?\n(.*?)```", re.DOTALL)
+
 
 def emit(kind: str, text: str = "", agent: str = "", **extra) -> None:
     """Record an event if a sink is installed. kind: phase | say | action | error."""
@@ -76,8 +94,9 @@ def describe_tool(name: str, tool_input: dict) -> tuple[str, str, dict]:
     tool = (name.split("__", 2)[-1] if name.startswith("mcp__") else name).removeprefix("browser_")
     verb = _VERBS.get(tool, tool.replace("_", " ").capitalize())
     i = tool_input if isinstance(tool_input, dict) else {}
-    element = i.get("element") or ""
-    extra: dict = {}
+    target_ref = str(i.get("target") or i.get("ref") or "")
+    element = i.get("element") or ("" if _REF.match(target_ref) else target_ref)
+    extra: dict = {"quiet": True} if tool in QUIET_TOOLS else {}
 
     if tool == "navigate":
         target = i.get("url", "")
@@ -94,6 +113,8 @@ def describe_tool(name: str, tool_input: dict) -> tuple[str, str, dict]:
         target = i.get("key", "")
     elif tool == "wait_for":
         target = i.get("text") or i.get("textGone") or (f"{i['time']}s" if "time" in i else "")
+    elif tool in ("evaluate", "run_code_unsafe"):
+        target = _short_code(i.get("function") or i.get("code") or "")
     elif tool == "take_screenshot":
         target = i.get("filename", "")
         if target:
@@ -101,7 +122,46 @@ def describe_tool(name: str, tool_input: dict) -> tuple[str, str, dict]:
     else:
         target = element
 
+    if tool in ELEMENT_TOOLS and not element:
+        extra["unnamed"] = True
     return tool, f"{verb}: {target}" if target else verb, extra
+
+
+def _short_code(code: str, limit: int = 72) -> str:
+    """A one-line glimpse of a script the agent ran, e.g. "document.title"."""
+    code = re.sub(r"^\s*(async\s*)?\(\s*\)\s*=>\s*", "", " ".join(code.split()))
+    code = code.removeprefix("{").removesuffix("}").strip().removeprefix("return ").rstrip(";")
+    return code if len(code) <= limit else code[: limit - 1] + "…"
+
+
+def element_from_result(result_text: str) -> str:
+    """Names the element an action used, from the Playwright code in the tool's result:
+    getByRole('button', { name: 'Sign in' }) -> '"Sign in" button'. "" if there's none."""
+    block = CODE_BLOCK.search(result_text or "")
+    if not block:
+        return ""
+    code = block.group(1)
+    found = list(_GET_BY.finditer(code))
+    if found:
+        kind, value, name = found[-1].groups()
+        value, name = (v.replace("\\'", "'") for v in (value, name or ""))
+        return {
+            "Role": f'"{name}" {value}' if name else value,
+            "Label": f'"{value}" field',
+            "Placeholder": f'"{value}" field',
+            "TestId": f'[{value}]',
+        }.get(kind, f'"{value}"')
+    locator = _LOCATOR.search(code)
+    return locator.group(1) if locator else ""
+
+
+def name_element(text: str, element: str) -> str:
+    """Adds the element to an action's description: 'Click' -> 'Click: "Sign in" button',
+    'Type: "abc"' -> 'Type: "Search" field ← "abc"'."""
+    verb, _, rest = text.partition(": ")
+    if not rest:
+        return f"{verb}: {element}"
+    return f"{verb}: {element} ← {rest}" if verb in ("Type", "Select") else f"{verb}: {element} {rest}"
 
 
 class EventLog:

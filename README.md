@@ -181,7 +181,7 @@ jq -Rs '{plan: ., only: ["TC-001", "TC-002"]}' testplan.md | curl -X POST localh
 curl localhost:8080/runs/992a81d740eb          # status: queued | running | passed | failed | completed | error | cancelled
 ```
 
-Every run has a **cost limit**, estimated at Anthropic API prices. Agents stop when they reach it, and tests they didn't finish are marked blocked. Pass `max_cost_usd` per run, or set the server defaults with `ARGUS_MAX_RUN_COST` (default $5), `ARGUS_MAX_DISCOVER_COST` ($3) and `ARGUS_MAX_EXPLORE_COST` ($2). With a Claude subscription login rather than an API key, usage counts against your plan instead of being billed, and the cost is only an estimate.
+Every run has a **cost limit**, estimated at Anthropic API prices. Agents stop when they reach it. Each test's result is saved the moment the agent finishes that test, so a run that hits its limit, is cancelled, or is cut short by a server restart keeps the tests it finished; the rest are blocked as **not reached**, and the run page offers to continue with just those. Pass `max_cost_usd` per run, or set the server defaults with `ARGUS_MAX_RUN_COST` (default $5), `ARGUS_MAX_DISCOVER_COST` ($3) and `ARGUS_MAX_EXPLORE_COST` ($2). With a Claude subscription login rather than an API key, usage counts against your plan instead of being billed, and the cost is only an estimate.
 
 | Endpoint | Description |
 |----------|-------------|
@@ -191,10 +191,11 @@ Every run has a **cost limit**, estimated at Anthropic API prices. Agents stop w
 | `POST /runs/{id}/cancel` | Cancel a queued or running run |
 | `DELETE /runs/{id}` | Delete a finished run and its files (tests already saved to suites are kept) |
 | `POST /runs/delete` | Delete several finished runs: `{"ids": [...]}`; active or unknown runs are skipped |
-| `POST /runs/{id}/rerun` | Start a new run of the same plan; `{"failed_only": true}` (default) re-runs just the failures |
+| `POST /runs/{id}/rerun` | Start a new run of the same tests; `{"failed_only": true}` (default) re-runs just the failures, `{"only": ["TC-005"]}` chosen tests, and `{"mode": "auto"}` switches a suite run's mode (so the AI looks at failed scripts). A suite run is re-run with the suite's current wording |
+| `POST /runs/{id}/tests/{test}/update` | Apply the rewording the tester proposed for an outdated test (the `update` in its result) to the run's suite |
 | `GET /runs/{id}/events?after=N` | Live agent activity (actions, narration, phases). Poll with `after` set to the returned `next` |
 | `GET /runs/{id}/plan` | The plan that was run |
-| `GET /runs/{id}/results` | Full structured results (JSON) |
+| `GET /runs/{id}/results` | Full structured results (JSON). While a test run is going, the tests finished so far, with `"partial": true` |
 | `GET /runs/{id}/report` | Markdown quality report |
 | `GET /runs/{id}/junit` | JUnit XML |
 | `GET /runs/{id}/screenshots` | Screenshot filenames; fetch one with `/screenshots/{name}` |
@@ -328,6 +329,34 @@ In the web UI you review the proposals, untick the ones you don't want, and save
 | `POST /projects/{slug}/suites/{suite}/run` | Run a suite (`only`, `parallel`, `url`, `max_cost_usd` optional) |
 | `POST /projects/{slug}/discover` | Start a discovery session |
 | `POST /projects/{slug}/explore` | Start an exploratory bug hunt |
+
+## Schedules
+
+A project can run its suites on a timer: every night, on weekdays, or on Friday evening. Create one on the project's **Schedules** tab, or with the API:
+
+```bash
+curl -X POST http://localhost:8080/projects/looma/schedules -H 'Content-Type: application/json' -d '{
+  "name": "Nightly",
+  "suites": ["smoke", "checkout"],
+  "days": [],
+  "time": "02:00",
+  "timezone": "Europe/Bucharest",
+  "callback_url": "https://hooks.myapp.com/argus",
+  "notify_on": "failure"
+}'
+```
+
+- `days` is a list of `mon`…`sun`; leave it empty for every day. `time` is `HH:MM` in `timezone` (an IANA name, default `UTC`).
+- Each suite gets its own run. Runs started together share a `batch` ID and carry the schedule's slug (`GET /runs?schedule=nightly`).
+- `mode` defaults to `auto`, so recorded scripts replay without AI and the AI only steps in for tests that fail. `max_cost_usd` is the limit for each suite's run, so one firing can cost up to that times the number of suites.
+- `notify_on: "failure"` calls `callback_url` only for runs that don't pass.
+- Schedules fire while the server is running. A run that comes due while the server is down is started if the server is back within an hour, and skipped otherwise. If the previous firing is still running, the new one is skipped. Either way the reason is shown on the schedule (`last_error`), as is any suite that couldn't start.
+
+| Endpoint | What it does |
+|----------|--------------|
+| `GET/POST /projects/{slug}/schedules` | List or create schedules |
+| `GET/PUT/DELETE /projects/{slug}/schedules/{schedule}` | Read, replace (`"enabled": false` pauses it), or delete a schedule |
+| `POST /projects/{slug}/schedules/{schedule}/run` | Run its suites now |
 
 ## The test plan format
 

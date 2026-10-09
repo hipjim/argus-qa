@@ -429,3 +429,115 @@ async def test_deleting_a_suite_deletes_its_scripts(client, fakes, tmp_path):
         (scripts_dir / "TC-001.mjs").write_text("//")
         await client.delete("/projects/looma/suites/smoke")
     assert not scripts_dir.exists()
+
+
+# ── acting on failures ───────────────────────────────────────
+
+OUTDATED_PLAN = """# Test Plan: Smoke
+
+### TC-001: Retailer logs in
+
+**Steps:**
+1. Log in as retailer
+2. Click New promotion
+
+**Acceptance criteria:**
+- The promotion form is shown
+
+### TC-002: Retailer creates promo {{promo}}
+
+1. Create promo {{promo}}
+"""
+
+
+@pytest.fixture
+def outdated_run(monkeypatch):
+    """Suite runs where TC-001 fails as outdated and comes with a proposed rewording."""
+    calls = []
+
+    async def execute_plan(plan, url, run_dir, **kwargs):
+        calls.append({"ids": [tc.id for tc in plan.cases], "plan": plan, **kwargs})
+        results = [
+            {"id": "TC-001", "status": "failed", "cause": "outdated", "notes": "The button is now Create promotion",
+             "update": {"steps": ["Log in as retailer", "Click Create promotion"]}}
+            if tc.id == "TC-001" else {"id": tc.id, "status": "passed"}
+            for tc in plan.cases
+        ]
+        merged = merge_results([json.dumps({"results": results})], plan)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "results.json").write_text(json.dumps(merged))
+        failed = [r["id"] for r in merged["results"] if r["status"] == "failed"]
+        return RunResult(run_dir, run_dir / "report.md", merged, failed, cost_usd=0.1)
+
+    monkeypatch.setattr(server, "execute_plan", execute_plan)
+    return calls
+
+
+async def test_a_proposed_update_is_applied_to_the_suite(client, outdated_run):
+    async with client:
+        await client.post("/projects", json=PROJECT)
+        await client.post("/projects/looma/suites", json={"name": "Smoke", "plan": OUTDATED_PLAN})
+        run = (await client.post("/projects/looma/suites/smoke/run", json={"mode": "ai"})).json()
+        run = await _finished(client, run["id"])
+        assert run["failed_ids"] == ["TC-001"] and run["updated"] == []
+
+        assert (await client.post(f"/runs/{run['id']}/tests/TC-002/update")).status_code == 404   # nothing proposed
+        resp = await client.post(f"/runs/{run['id']}/tests/tc-001/update")
+        assert resp.status_code == 200
+        suite = (await client.get("/projects/looma/suites/smoke")).json()
+        assert "2. Click Create promotion" in suite["plan"] and "Click New promotion" not in suite["plan"]
+        assert "- The promotion form is shown" in suite["plan"]            # criteria weren't proposed, so they stay
+        # The other test's text is untouched, placeholders included
+        assert "### TC-002: Retailer creates promo {{promo}}\n\n1. Create promo {{promo}}" in suite["plan"]
+        assert (await client.get(f"/runs/{run['id']}")).json()["updated"] == ["TC-001"]
+
+        # The proposal was written for the wording the run tested, which is gone now
+        again = await client.post(f"/runs/{run['id']}/tests/TC-001/update")
+        assert again.status_code == 409 and "edited in the suite" in again.json()["detail"]
+
+        # Re-running the failure uses the suite as it reads now, not the run's old copy
+        rerun = (await client.post(f"/runs/{run['id']}/rerun")).json()
+        await _finished(client, rerun["id"])
+    assert outdated_run[-1]["ids"] == ["TC-001"]
+    assert "Click Create promotion" in outdated_run[-1]["plan"].cases[0].raw_markdown
+
+
+async def test_updates_need_a_suite_and_a_clean_proposal(client, outdated_run, tmp_path):
+    async with client:
+        await client.post("/projects", json=PROJECT)
+        quick = (await client.post("/runs", json={"project": "looma", "plan": OUTDATED_PLAN})).json()
+        await _finished(client, quick["id"])
+        resp = await client.post(f"/runs/{quick['id']}/tests/TC-001/update")
+        assert resp.status_code == 409 and "saved suite" in resp.json()["detail"]
+
+        await client.post("/projects/looma/suites", json={"name": "Smoke", "plan": OUTDATED_PLAN})
+        run = (await client.post("/projects/looma/suites/smoke/run", json={"mode": "ai"})).json()
+        await _finished(client, run["id"])
+        # A secret the tester wrote out was redacted from the results; it mustn't reach the suite
+        path = tmp_path / "runs" / run["id"] / "results.json"
+        path.write_text(path.read_text().replace("Click Create promotion", "Type [redacted]"))
+        resp = await client.post(f"/runs/{run['id']}/tests/TC-001/update")
+        assert resp.status_code == 422 and "placeholder" in resp.json()["detail"]
+
+
+async def test_rerun_can_switch_mode_and_follows_the_suite(client, outdated_run):
+    async with client:
+        await client.post("/projects", json=PROJECT)
+        await client.post("/projects/looma/suites", json={"name": "Smoke", "plan": OUTDATED_PLAN})
+        run = (await client.post("/projects/looma/suites/smoke/run", json={"mode": "script", "only": ["TC-001"]})).json()
+        await _finished(client, run["id"])
+
+        # "Let the AI look": the same failed tests, in Auto this time
+        auto = (await client.post(f"/runs/{run['id']}/rerun", json={"mode": "auto"})).json()
+        assert auto["mode"] == "auto" and auto["test_ids"] == ["TC-001"] and auto["suite"] == "smoke"
+        # "Re-run all" repeats what the run covered, not the whole suite
+        everything = (await client.post(f"/runs/{run['id']}/rerun", json={"failed_only": False})).json()
+        assert everything["test_ids"] == ["TC-001"] and everything["mode"] == "script"
+        await _finished(client, auto["id"])
+        await _finished(client, everything["id"])
+
+        # Once the test is gone from the suite there is nothing left to re-run
+        only_second = OUTDATED_PLAN.split("### TC-001")[0] + "### TC-002" + OUTDATED_PLAN.split("### TC-002")[1]
+        await client.put("/projects/looma/suites/smoke", json={"name": "Smoke", "plan": only_second})
+        resp = await client.post(f"/runs/{run['id']}/rerun")
+        assert resp.status_code == 409 and "any more" in resp.json()["detail"]

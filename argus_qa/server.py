@@ -15,6 +15,10 @@ Projects (target URL, test accounts, test data, secrets, standing instructions)
 are stored under <data_dir>/projects/<slug>.json and referenced by runs. Secrets
 are masked in API responses and redacted from results and reports.
 
+Schedules (<data_dir>/schedules/<project>/<slug>.json) run a project's suites
+on chosen weekdays at a set time, while the server is running. A run that
+comes due while the server is down for more than an hour is skipped.
+
 Every run has a cost limit (estimated at API prices); agents stop when they
 reach it. Defaults come from ARGUS_MAX_RUN_COST, ARGUS_MAX_DISCOVER_COST and
 ARGUS_MAX_EXPLORE_COST.
@@ -31,8 +35,9 @@ import secrets
 import shutil
 import traceback
 import uuid
-from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -40,21 +45,31 @@ import httpx
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
 from argus_qa import colors as c
-from argus_qa.agents.orchestrator import discover_app, draft_test_case, execute_plan, explore_app
+from argus_qa.agents.orchestrator import (
+    close_run_results,
+    discover_app,
+    draft_test_case,
+    execute_plan,
+    explore_app,
+)
 from argus_qa.events import EventLog, capture
 from argus_qa.plan_parser import (
     TestPlan,
     append_cases,
+    case_fields,
     compose_plan,
     parse_test_plan,
     plan_fields,
     plan_from_scenario,
     render_plan,
+    replace_case,
 )
-from argus_qa.project import MASK, Project, slugify, substitute
+from argus_qa.project import MASK, REDACTED, Project, slugify, substitute
+from argus_qa.results import failed_ids, not_reached_ids
+from argus_qa.schedules import DAYS, next_fire, zone
 from argus_qa.scripts import case_hash
 
 WEB_DIR = Path(__file__).parent / "web"
@@ -63,6 +78,12 @@ RunKind = Literal["test", "discover", "explore"]
 RunMode = Literal["auto", "script", "ai"]
 RunStatus = Literal["queued", "running", "passed", "failed", "completed", "error", "cancelled"]
 FINISHED: set[str] = {"passed", "failed", "completed", "error", "cancelled"}
+Day = Literal["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+NotifyOn = Literal["always", "failure"]
+
+SCHEDULE_TICK_SECONDS = 30
+# A scheduled run that is later than this (the server was down or asleep) is skipped
+SCHEDULE_GRACE = timedelta(hours=1)
 
 DEFAULT_COSTS = {"test": 5.0, "discover": 3.0, "explore": 2.0}
 _COST_ENV = {
@@ -157,6 +178,33 @@ class SuiteRunRequest(BaseModel):
     callback_url: HttpUrl | None = None
 
 
+class ScheduleModel(BaseModel):
+    """Run one or more of a project's suites on chosen weekdays at a set time."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    slug: str | None = Field(
+        None, pattern=r"^[a-z0-9][a-z0-9-]*$", description="URL-safe ID; derived from the name if omitted."
+    )
+    suites: list[str] = Field(min_length=1, description="Slugs of the suites to run; each gets its own run.")
+    days: list[Day] = Field([], description="Weekdays to run on. Empty = every day.")
+    time: str = Field("02:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$", description="Time of day, HH:MM.")
+    timezone: str = Field("UTC", description="IANA timezone the time is in, e.g. Europe/Bucharest.")
+    mode: RunMode = "auto"
+    parallel: int = Field(1, ge=1, le=8)
+    max_cost_usd: float | None = Field(None, gt=0, le=100, description="Cost limit for each suite's run.")
+    callback_url: HttpUrl | None = Field(None, description="POSTed each run's record when it finishes.")
+    notify_on: NotifyOn = Field("always", description="failure: only call back for runs that don't pass.")
+    enabled: bool = True
+
+    @field_validator("timezone")
+    @classmethod
+    def _known_timezone(cls, value: str) -> str:
+        zone(value)
+        return value
+
+
 class DiscoverRequest(BaseModel):
     focus: str = Field("", description="What to concentrate on, e.g. 'promotions'. Empty = the whole app.")
     url: HttpUrl | None = Field(None, description="Where to start. Defaults to the project's URL.")
@@ -218,6 +266,10 @@ class DraftRequest(BaseModel):
 
 class RerunRequest(BaseModel):
     failed_only: bool = Field(True, description="Re-run only the tests that failed or were blocked.")
+    only: list[str] | None = Field(None, description="Re-run just these test IDs, whatever their result.")
+    mode: RunMode | None = Field(
+        None, description="How to run a saved suite's tests this time. Defaults to the run's own mode."
+    )
 
 
 class Run(BaseModel):
@@ -237,12 +289,16 @@ class Run(BaseModel):
     summary: dict | None = None
     failed_ids: list[str] = []
     accepted: list[str] = Field([], description="Proposed test IDs already saved to a suite.")
+    updated: list[str] = Field([], description="Test IDs whose proposed rewording was applied to the suite.")
     cost_usd: float | None = None
     max_cost_usd: float | None = None
     models: list[str] = Field([], description="Models the agents used, e.g. claude-sonnet-5.")
     error: str | None = None
     callback_url: str | None = None
+    notify_on: NotifyOn = "always"
     parallel: int = 1
+    schedule: str | None = Field(None, description="Slug of the schedule that started this run.")
+    batch: str | None = Field(None, description="Shared by the runs one schedule firing started.")
 
 
 class Suite(BaseModel):
@@ -252,6 +308,28 @@ class Suite(BaseModel):
     plan: str
     created_at: str
     updated_at: str
+
+
+class Schedule(BaseModel):
+    slug: str
+    name: str
+    project: str
+    suites: list[str]
+    days: list[Day] = []
+    time: str
+    timezone: str = "UTC"
+    mode: RunMode = "auto"
+    parallel: int = 1
+    max_cost_usd: float | None = None
+    callback_url: str | None = None
+    notify_on: NotifyOn = "always"
+    enabled: bool = True
+    created_at: str
+    updated_at: str
+    handled_at: str | None = Field(None, description="When the scheduler last fired or skipped a due run.")
+    last_fired_at: str | None = None
+    last_batch: str | None = None
+    last_error: str | None = None
 
 
 def _now() -> str:
@@ -371,6 +449,65 @@ class SuiteStore:
         shutil.rmtree(self.dir / project, ignore_errors=True)
 
 
+class ScheduleStore:
+    """Schedules, one JSON file per schedule under schedules/<project>/."""
+
+    def __init__(self, data_dir: Path):
+        self.dir = data_dir / "schedules"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self._unreadable: set[Path] = set()
+
+    def _path(self, project: str, slug: str) -> Path:
+        return self.dir / project / f"{slug}.json"
+
+    def get(self, project: str, slug: str) -> Schedule:
+        path = self._path(project, slug)
+        if not path.is_file():
+            raise HTTPException(404, f"Schedule {slug!r} not found in project {project!r}.")
+        try:
+            return Schedule.model_validate_json(path.read_text())
+        except ValueError as e:
+            raise HTTPException(
+                500, f"Schedule {slug!r} in project {project!r} can't be read; delete it and create it again."
+            ) from e
+
+    def exists(self, project: str, slug: str) -> bool:
+        return self._path(project, slug).is_file()
+
+    def list(self, project: str | None = None) -> list[Schedule]:
+        """One project's schedules, or every project's. A file that can't be read is left out,
+        so one damaged schedule doesn't stop the others."""
+        schedules = []
+        for path in sorted(self.dir.glob(f"{project or '*'}/*.json")):
+            try:
+                schedules.append(Schedule.model_validate_json(path.read_text()))
+            except (OSError, ValueError) as e:
+                if path not in self._unreadable:  # the scheduler lists these every tick
+                    self._unreadable.add(path)
+                    name = f"{path.parent.name}/{path.stem}"
+                    print(c.warn(f"  [schedule {name}] can't be read, skipping it ({type(e).__name__})"))
+        return schedules
+
+    def save(self, schedule: Schedule) -> None:
+        path = self._path(schedule.project, schedule.slug)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Written whole or not at all: the scheduler rewrites these files while the server runs
+        draft = path.with_suffix(".tmp")
+        draft.write_text(schedule.model_dump_json(indent=2))
+        draft.replace(path)
+        self._unreadable.discard(path)
+
+    def delete(self, project: str, slug: str) -> None:
+        path = self._path(project, slug)
+        if not path.is_file():
+            raise HTTPException(404, f"Schedule {slug!r} not found in project {project!r}.")
+        path.unlink()
+        self._unreadable.discard(path)
+
+    def delete_project(self, project: str) -> None:
+        shutil.rmtree(self.dir / project, ignore_errors=True)
+
+
 def _project_from_model(model: ProjectModel) -> Project:
     try:
         return Project.from_dict(model.model_dump(exclude_none=True))
@@ -424,6 +561,7 @@ class RunManager:
                 run.status = "error"
                 run.error = "Server restarted before the run finished."
                 run.finished_at = _now()
+                self._keep_results(run, "The server restarted before this test finished.")
                 self.save(run)
             self.runs[run.id] = run
 
@@ -455,6 +593,17 @@ class RunManager:
         task.add_done_callback(lambda _: self.tasks.pop(run.id, None))
         return run
 
+    def _keep_results(self, run: Run, why: str) -> None:
+        """A test run stopped part-way: the tests that finished keep their results, and the
+        rest are marked not reached, with `why` as their note."""
+        plan_file = self.run_dir(run.id) / "plan.md"
+        if run.kind != "test" or not plan_file.is_file():
+            return
+        closed = close_run_results(self.run_dir(run.id), parse_test_plan(plan_file.read_text()), run.url, why)
+        if closed:
+            run.summary = closed["summary"]
+            run.failed_ids = failed_ids(closed)
+
     async def _run_job(self, run: Run, job: Callable[[], Awaitable[None]]) -> None:
         try:
             async with self.semaphore:
@@ -466,23 +615,26 @@ class RunManager:
                     await job()
         except asyncio.CancelledError:
             run.status = "cancelled"
+            self._keep_results(run, "The run was cancelled before this test finished.")
         except HTTPException:
             raise
         except Exception as e:  # noqa: BLE001 — any failure must be recorded on the run
             run.status = "error"
             run.error = f"{type(e).__name__}: {e}"
             traceback.print_exc()
+            self._keep_results(run, "The run stopped with an error before this test finished.")
         finally:
             run.finished_at = _now()
             self.save(run)
             print(c.header(f"  [run {run.id}] {run.status}"))
-            if run.callback_url:
+            if run.callback_url and (run.notify_on == "always" or run.status != "passed"):
                 await _notify(run)
 
     # test runs
 
     def submit(
-        self, req: RunRequest, *, suite: str | None = None, title: str | None = None, mode: RunMode = "ai"
+        self, req: RunRequest, *, suite: str | None = None, title: str | None = None, mode: RunMode = "ai",
+        schedule: Schedule | None = None, batch: str | None = None,
     ) -> Run:
         """Queue a test run. Runs of a saved suite replay and record scripts according to `mode`;
         other runs always use AI."""
@@ -511,7 +663,10 @@ class RunManager:
             test_ids=[tc.id for tc in plan.cases],
             max_cost_usd=max_cost,
             callback_url=str(req.callback_url) if req.callback_url else None,
+            notify_on=schedule.notify_on if schedule else "always",
             parallel=req.parallel,
+            schedule=schedule.slug if schedule else None,
+            batch=batch,
         )
         (self.run_dir(run.id) / "plan.md").write_text(plan.to_markdown())
 
@@ -538,10 +693,15 @@ class RunManager:
             else:
                 run.status = "failed" if result.failed_ids else "passed"
                 stopped = [e for e in result.results.get("agent_errors", []) if "error_max" in e]
+                unreached = not_reached_ids(result.results)
                 if stopped:
+                    left = (
+                        f"{len(unreached)} of {len(plan.cases)} tests weren't reached; the others keep "
+                        "their results." if unreached else "every test had its result by then."
+                    )
                     run.error = (
                         f"{len(stopped)} agent(s) stopped early at the cost or turn limit "
-                        f"(${max_cost:.2f}); their unfinished tests are marked blocked."
+                        f"(${max_cost:.2f}): {left}"
                     )
 
         return self._start(run, job)
@@ -608,6 +768,112 @@ class RunManager:
         return True
 
 
+class Scheduler:
+    """Starts a run of each of a schedule's suites when the schedule comes due."""
+
+    def __init__(self, schedules: ScheduleStore, manager: RunManager):
+        self.schedules = schedules
+        self.manager = manager
+
+    def next_run(self, schedule: Schedule) -> datetime | None:
+        """When the schedule is next due; a time in the past is due now. None if it's paused."""
+        if not schedule.enabled:
+            return None
+        after = max(datetime.fromisoformat(t) for t in (schedule.updated_at, schedule.handled_at) if t)
+        return next_fire(schedule.days, schedule.time, schedule.timezone, after)
+
+    def fire(self, schedule: Schedule, *, due: datetime | None = None) -> list[Run]:
+        """Queue a run of each suite. `due` is set when the clock, not a person, asked for it."""
+        changes: dict = {}
+        active = any(
+            r.project == schedule.project and r.schedule == schedule.slug and r.status not in FINISHED
+            for r in self.manager.runs.values()
+        )
+        if active and not due:
+            raise HTTPException(409, f"Schedule {schedule.slug!r} is already running.")
+        if active:
+            changes["last_error"] = (
+                f"Skipped the run due {self._local(schedule, due)}: the previous one hadn't finished."
+            )
+            self.schedules.save(schedule.model_copy(update=changes))
+            return []
+
+        batch = uuid.uuid4().hex[:12]
+        runs, errors = [], []
+        for slug in schedule.suites:
+            try:
+                suite = self.manager.suites.get(schedule.project, slug)
+                request = RunRequest(
+                    plan=suite.plan, project=schedule.project, parallel=schedule.parallel,
+                    max_cost_usd=schedule.max_cost_usd, callback_url=schedule.callback_url,
+                )
+                runs.append(self.manager.submit(
+                    request, suite=suite.slug, title=suite.name, mode=schedule.mode,
+                    schedule=schedule, batch=batch,
+                ))
+            except HTTPException as e:
+                # Nobody is waiting for a response, so the reason is kept on the schedule
+                errors.append(f"{slug}: {e.detail}")
+        changes.update(
+            last_fired_at=_now(), last_batch=batch if runs else None, last_error="\n".join(errors) or None
+        )
+        self.schedules.save(schedule.model_copy(update=changes))
+        return runs
+
+    def tick(self, now: datetime | None = None) -> None:
+        """Fire every schedule that has come due."""
+        now = now or datetime.now(UTC)
+        for schedule in self.schedules.list():
+            due = None
+            try:
+                due = self.next_run(schedule)
+                if due is None or due > now:
+                    continue
+                schedule = schedule.model_copy(update={"handled_at": now.isoformat(timespec="seconds")})
+                if now - due > SCHEDULE_GRACE:
+                    missed = f"Missed the run due {self._local(schedule, due)}: the server wasn't running."
+                    self.schedules.save(schedule.model_copy(update={"last_error": missed}))
+                    continue
+                print(c.header(f"\n  [schedule {schedule.project}/{schedule.slug}] due"))
+                self.fire(schedule, due=due)
+            except Exception as e:  # noqa: BLE001 — one broken schedule must not stop the others
+                print(c.warn(f"  [schedule {schedule.project}/{schedule.slug}] {type(e).__name__}: {e}"))
+                if due is not None and due <= now:
+                    self._gave_up(schedule, f"Couldn't start the run due {self._local(schedule, due)}: {e}")
+
+    def _gave_up(self, schedule: Schedule, problem: str) -> None:
+        """Keep the problem on the schedule and count the due time as handled, so a run that
+        can't start isn't tried again on every tick."""
+        try:
+            self.schedules.save(schedule.model_copy(update={"last_error": problem}))
+        except OSError:
+            pass  # saving may be what failed; the next tick tries again
+
+    async def run_forever(self) -> None:
+        while True:
+            try:
+                self.tick()
+            except Exception as e:  # noqa: BLE001 — keep ticking
+                print(c.warn(f"  [scheduler] {type(e).__name__}: {e}"))
+            await asyncio.sleep(SCHEDULE_TICK_SECONDS)
+
+    @staticmethod
+    def _local(schedule: Schedule, when: datetime) -> str:
+        return when.astimezone(zone(schedule.timezone)).strftime("%a %d %b %H:%M")
+
+
+# The UI has no build step or versioned file names, so browsers must revalidate
+# it; otherwise an upgrade keeps running the old app.js until a hard reload
+NO_CACHE = {"Cache-Control": "no-cache"}
+
+
+class _WebFiles(StaticFiles):
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers.update(NO_CACHE)
+        return response
+
+
 def _shorten(text: str, limit: int) -> str:
     text = " ".join(text.split())
     if len(text) <= limit:
@@ -664,16 +930,27 @@ def create_app(data_dir: str | Path = "argus-data", max_concurrent: int = 2) -> 
         if not secrets.compare_digest(header, f"Bearer {api_key}"):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing or invalid API key.")
 
+    projects = ProjectStore(Path(data_dir))
+    suites = SuiteStore(Path(data_dir))
+    schedules = ScheduleStore(Path(data_dir))
+    manager = RunManager(Path(data_dir), max_concurrent, projects, suites)
+    scheduler = Scheduler(schedules, manager)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        ticking = asyncio.create_task(scheduler.run_forever())
+        yield
+        ticking.cancel()
+
     app = FastAPI(
         title="argus-qa",
         description="AI QA tester: post a test plan or scenario, get results, a report, and screenshots.",
+        lifespan=lifespan,
     )
     # Everything except the web UI's static files and /health needs the API key
     api = APIRouter(dependencies=[Depends(require_key)])
-    projects = ProjectStore(Path(data_dir))
-    suites = SuiteStore(Path(data_dir))
-    manager = RunManager(Path(data_dir), max_concurrent, projects, suites)
     app.state.manager = manager
+    app.state.scheduler = scheduler
 
     def get_run(run_id: str) -> Run:
         run = manager.runs.get(run_id)
@@ -708,15 +985,44 @@ def create_app(data_dir: str | Path = "argus-data", max_concurrent: int = 2) -> 
             view["plan"] = suite.plan
         return view
 
+    def schedule_view(schedule: Schedule) -> dict:
+        names = {s.slug: s.name for s in suites.list(schedule.project)}
+        due = scheduler.next_run(schedule)
+        batch = schedule.last_batch
+        last = {r.suite: r for r in manager.runs.values() if batch and r.batch == batch}
+        return {
+            **schedule.model_dump(exclude={"handled_at"}),
+            "suite_names": {slug: names.get(slug) for slug in schedule.suites},
+            "next_run_at": due.isoformat(timespec="seconds") if due else None,
+            "cost_limit_usd": schedule.max_cost_usd or manager.costs["test"],
+            "last_runs": [
+                {"id": r.id, "suite": r.suite, "title": r.title, "status": r.status, "summary": r.summary}
+                for r in last.values()
+            ],
+        }
+
+    def schedule_from(body: ScheduleModel, project: str, slug: str, existing: Schedule | None) -> Schedule:
+        unknown = [s for s in body.suites if not suites.exists(project, s)]
+        if unknown:
+            raise HTTPException(422, f"Unknown suites in project {project!r}: {', '.join(unknown)}")
+        fields = body.model_dump(exclude={"slug", "callback_url"})
+        fields["name"] = body.name.strip()
+        fields["suites"] = list(dict.fromkeys(body.suites))
+        fields["days"] = [d for d in DAYS if d in body.days]
+        fields["callback_url"] = str(body.callback_url) if body.callback_url else None
+        if existing:
+            return existing.model_copy(update={**fields, "updated_at": _now()})
+        return Schedule(slug=slug, project=project, created_at=_now(), updated_at=_now(), **fields)
+
     @app.get("/health")
     async def health() -> dict:
         return {"status": "ok", "auth_required": bool(api_key), "default_max_cost_usd": manager.costs}
 
     @app.get("/", include_in_schema=False)
     async def web_ui() -> FileResponse:
-        return FileResponse(WEB_DIR / "index.html")
+        return FileResponse(WEB_DIR / "index.html", headers=NO_CACHE)
 
-    app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
+    app.mount("/static", _WebFiles(directory=WEB_DIR), name="static")
 
     # ── projects ─────────────────────────────────────────────
 
@@ -750,6 +1056,7 @@ def create_app(data_dir: str | Path = "argus-data", max_concurrent: int = 2) -> 
     async def delete_project(slug: str) -> Response:
         projects.delete(slug)
         suites.delete_project(slug)
+        schedules.delete_project(slug)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @api.post("/projects/{slug}/discover", status_code=status.HTTP_202_ACCEPTED)
@@ -827,6 +1134,48 @@ def create_app(data_dir: str | Path = "argus-data", max_concurrent: int = 2) -> 
         suites.delete_script(slug, suite_slug, test_id)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
+    # ── schedules ────────────────────────────────────────────
+
+    @api.get("/projects/{slug}/schedules")
+    async def list_schedules(slug: str) -> list[dict]:
+        projects.get(slug)
+        return [schedule_view(s) for s in schedules.list(slug)]
+
+    @api.post("/projects/{slug}/schedules", status_code=status.HTTP_201_CREATED)
+    async def create_schedule(slug: str, body: ScheduleModel) -> dict:
+        """Run suites of this project on chosen weekdays at a set time."""
+        projects.get(slug)
+        schedule_slug = body.slug or slugify(body.name)
+        if schedules.exists(slug, schedule_slug):
+            raise HTTPException(409, f"Schedule {schedule_slug!r} already exists; use PUT to update it.")
+        schedule = schedule_from(body, slug, schedule_slug, None)
+        schedules.save(schedule)
+        return schedule_view(schedule)
+
+    @api.get("/projects/{slug}/schedules/{schedule_slug}")
+    async def read_schedule(slug: str, schedule_slug: str) -> dict:
+        return schedule_view(schedules.get(slug, schedule_slug))
+
+    @api.put("/projects/{slug}/schedules/{schedule_slug}")
+    async def update_schedule(slug: str, schedule_slug: str, body: ScheduleModel) -> dict:
+        schedule = schedule_from(body, slug, schedule_slug, schedules.get(slug, schedule_slug))
+        schedules.save(schedule)
+        return schedule_view(schedule)
+
+    @api.delete("/projects/{slug}/schedules/{schedule_slug}", status_code=status.HTTP_204_NO_CONTENT)
+    async def delete_schedule(slug: str, schedule_slug: str) -> Response:
+        """Delete a schedule. Its past runs are kept."""
+        schedules.delete(slug, schedule_slug)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @api.post("/projects/{slug}/schedules/{schedule_slug}/run", status_code=status.HTTP_202_ACCEPTED)
+    async def run_schedule(slug: str, schedule_slug: str) -> list[Run]:
+        """Run the schedule's suites now, whether or not it's enabled."""
+        runs = scheduler.fire(schedules.get(slug, schedule_slug))
+        if not runs:
+            raise HTTPException(422, schedules.get(slug, schedule_slug).last_error or "Nothing to run.")
+        return runs
+
     # ── editing helpers ──────────────────────────────────────
 
     @api.post("/plans/parse")
@@ -857,13 +1206,16 @@ def create_app(data_dir: str | Path = "argus-data", max_concurrent: int = 2) -> 
 
     @api.get("/runs")
     async def list_runs(
-        limit: int = 50, project: str | None = None, suite: str | None = None, kind: RunKind | None = None
+        limit: int = 50, project: str | None = None, suite: str | None = None, kind: RunKind | None = None,
+        schedule: str | None = None, batch: str | None = None,
     ) -> list[Run]:
         runs = [
             r for r in manager.runs.values()
             if (project is None or r.project == project)
             and (suite is None or r.suite == suite)
             and (kind is None or r.kind == kind)
+            and (schedule is None or r.schedule == schedule)
+            and (batch is None or r.batch == batch)
         ]
         runs.sort(key=lambda r: r.created_at, reverse=True)
         return runs[:limit]
@@ -892,23 +1244,76 @@ def create_app(data_dir: str | Path = "argus-data", max_concurrent: int = 2) -> 
 
     @api.post("/runs/{run_id}/rerun", status_code=status.HTTP_202_ACCEPTED)
     async def rerun(run_id: str, body: RerunRequest | None = None) -> Run:
+        """Run a test run's tests again: the failed ones, all of them, or the ones in `only`.
+        A run of a saved suite uses the tests as the suite words them now, so a test fixed
+        after the run is re-run as fixed."""
         run = get_run(run_id)
         if run.kind != "test":
             raise HTTPException(409, "Only test runs can be re-run.")
-        failed_only = body.failed_only if body else True
-        if failed_only and not run.failed_ids:
+        body = body or RerunRequest()
+        if not body.only and body.failed_only and not run.failed_ids:
             raise HTTPException(409, f"Run {run_id} has no failed tests to re-run.")
+        only = body.only or (run.failed_ids if body.failed_only else None)
+        in_suite = bool(run.project and run.suite and suites.exists(run.project, run.suite))
+        if in_suite:
+            plan_text = suites.get(run.project, run.suite).plan
+            if not body.only:
+                # The run may have covered part of the suite, and tests may have been removed since
+                current = {tc.id for tc in parse_test_plan(plan_text).cases}
+                only = [i for i in only or run.test_ids if i in current]
+                if not only:
+                    raise HTTPException(409, "None of this run's tests are in the suite any more.")
+        else:
+            plan_text = run_file(run_id, "plan.md").read_text()
         return manager.submit(
             RunRequest(
-                plan=run_file(run_id, "plan.md").read_text(),
+                plan=plan_text,
                 project=run.project,
                 url=run.url,
-                only=run.failed_ids if failed_only else None,
+                only=only,
                 parallel=run.parallel,
                 max_cost_usd=run.max_cost_usd,
             ),
-            suite=run.suite, title=run.title, mode=run.mode,
+            suite=run.suite if in_suite else None, title=run.title, mode=body.mode or run.mode,
         )
+
+    @api.post("/runs/{run_id}/tests/{test_id}/update")
+    async def apply_update(run_id: str, test_id: str) -> dict:
+        """Write the rewording the tester proposed for a test (the `update` in its result) into
+        the suite the run came from. The test keeps its ID; its script becomes outdated."""
+        run = get_run(run_id)
+        if run.kind != "test" or not (run.project and run.suite):
+            raise HTTPException(409, "This run didn't come from a saved suite, so there's nothing to update.")
+        results = json.loads(run_file(run_id, "results.json").read_text()).get("results", [])
+        result = next((r for r in results if str(r.get("id", "")).upper() == test_id.upper()), None)
+        update = (result or {}).get("update")
+        if not update:
+            raise HTTPException(404, f"No update was proposed for {test_id} in this run.")
+        if REDACTED in json.dumps(update):
+            raise HTTPException(
+                422, "The proposed wording showed a secret value, which was removed. Edit the test by "
+                "hand and use a {{placeholder}} for the secret.",
+            )
+        suite = suites.get(run.project, run.suite)
+
+        def case(plan_text: str):
+            return next((tc for tc in parse_test_plan(plan_text).cases if tc.id == result["id"]), None)
+
+        current, ran = case(suite.plan), case(run_file(run_id, "plan.md").read_text())
+        if current is None:
+            raise HTTPException(409, f"{result['id']} is no longer in the suite {suite.name!r}.")
+        if ran is None or case_hash(current) != case_hash(ran):
+            raise HTTPException(
+                409, f"{result['id']} was edited in the suite after this run. Re-run it to get an "
+                "update for its current wording.",
+            )
+        plan_text = replace_case(suite.plan, current, {**case_fields(current), **update})
+        _check_suite_plan(plan_text, projects.get(run.project))
+        suite = suite.model_copy(update={"plan": plan_text, "updated_at": _now()})
+        suites.save(suite)
+        run.updated = sorted(set(run.updated) | {result["id"]})
+        manager.save(run)
+        return suite_view(suite)
 
     @api.get("/runs/{run_id}/proposed")
     async def read_proposed(run_id: str) -> dict:

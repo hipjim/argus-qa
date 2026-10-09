@@ -24,6 +24,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
+from argus_qa.events import CODE_BLOCK
 from argus_qa.plan_parser import TestCase, case_fields
 
 RUNNER_JS = Path(__file__).parent / "runner" / "replay.mjs"
@@ -36,9 +37,27 @@ _NOT_REPLAYED = {
     "find", "close", "install",
 }
 CHECK_KINDS = ("text_visible", "text_hidden", "element_visible", "url_contains", "field_value", "manual")
-_CODE_BLOCK = re.compile(
-    r"### Ran Playwright code\s*```(?:js|javascript|ts|typescript)?\n(.*?)```", re.DOTALL
-)
+# What a check of each kind must say for a script to verify it
+_CHECK_NEEDS = {
+    "text_visible": "text", "text_hidden": "text", "element_visible": "role",
+    "url_contains": "value", "field_value": "label",
+}
+
+
+class RunnerError(RuntimeError):
+    """The script runner couldn't be installed or didn't run."""
+
+
+def check_problem(check: dict) -> str | None:
+    """Why a check can't be recorded, or None if it can. The check tool answers with this, and
+    the Recorder leaves such a check out: the agent sees the error and calls again."""
+    kind = check.get("kind")
+    if kind not in CHECK_KINDS:
+        return f"Unknown kind {kind!r}; use one of {', '.join(CHECK_KINDS)}."
+    needs = _CHECK_NEEDS.get(kind)
+    if needs and not check.get(needs):
+        return f"A {kind} check needs `{needs}`."
+    return None
 
 
 def case_hash(case: TestCase) -> str:
@@ -76,6 +95,8 @@ class Recorder:
             test_id, step = _norm_id(args.get("test_id")), _int(args.get("step"))
             self._events.append({"kind": "step", "test": test_id, "step": step})
         elif name == ARGUS_TOOL + "check":
+            if check_problem(args):
+                return  # the tool turned it down
             check = {k: v for k, v in args.items() if k != "test_id"}
             self._events.append({"kind": "check", "test": _norm_id(args.get("test_id")), "check": check})
         elif name.startswith(PLAYWRIGHT_TOOL) and name[len(PLAYWRIGHT_TOOL):] not in _NOT_REPLAYED:
@@ -86,10 +107,10 @@ class Recorder:
         index = self._pending.pop(tool_id, None)
         if index is None:
             return
-        text = _content_text(content)
+        text = content_text(content)
         if is_error or text.lstrip().startswith("### Error"):
             return  # failed attempts aren't part of the test
-        match = _CODE_BLOCK.search(text)
+        match = CODE_BLOCK.search(text)
         if match:
             self._events[index]["code"] = match.group(1).strip()
 
@@ -256,7 +277,7 @@ def _int(value) -> int:
         return 0
 
 
-def _content_text(content) -> str:
+def content_text(content) -> str:
     if isinstance(content, str):
         return content
     parts = []
@@ -284,16 +305,20 @@ def ensure_runner(playwright_core_version: str | None = None) -> Path:
         installed = json.loads(marker.read_text()).get("version")
         if playwright_core_version is None or installed == playwright_core_version:
             return directory
-    if playwright_core_version is None:
-        from argus_qa.agents.orchestrator import playwright_core_version as lookup
+    try:
+        if playwright_core_version is None:
+            from argus_qa.agents.orchestrator import playwright_core_version as lookup
 
-        playwright_core_version = lookup()
-    directory.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["npm", "install", "--prefix", str(directory), "--no-save", "--no-audit", "--no-fund",
-         f"playwright-core@{playwright_core_version}"],
-        check=True, capture_output=True, text=True,
-    )
+            playwright_core_version = lookup()
+        directory.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["npm", "install", "--prefix", str(directory), "--no-save", "--no-audit", "--no-fund",
+             f"playwright-core@{playwright_core_version}"],
+            check=True, capture_output=True, text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as e:
+        detail = (getattr(e, "stderr", None) or str(e)).strip()[-500:]
+        raise RunnerError(f"The script runner couldn't be installed: {detail}") from e
     return directory
 
 
@@ -317,16 +342,19 @@ async def replay(
         "tests": [{"id": tid, "file": str(path.resolve())} for tid, path in scripts.items()],
     }
     screenshot_dir.mkdir(parents=True, exist_ok=True)
-    proc = await asyncio.create_subprocess_exec(
-        "node", str(RUNNER_JS),
-        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        env={**os.environ, "ARGUS_RUNNER_DIR": str(runner)},
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "node", str(RUNNER_JS),
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "ARGUS_RUNNER_DIR": str(runner)},
+        )
+    except OSError as e:
+        raise RunnerError(f"The script runner couldn't start: {e}") from e
     out, err = await proc.communicate(json.dumps(job).encode())
     try:
         results = json.loads(out.decode() or "{}").get("results", [])
     except json.JSONDecodeError:
         results = []
     if proc.returncode != 0 and not results:
-        raise RuntimeError(f"The script runner failed: {err.decode().strip()[-500:] or 'no output'}")
+        raise RunnerError(f"The script runner failed: {err.decode().strip()[-500:] or 'no output'}")
     return {r["id"]: r for r in results}

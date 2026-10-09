@@ -8,7 +8,7 @@ import pytest
 
 from argus_qa import server
 from argus_qa.agents.orchestrator import RunResult
-from argus_qa.results import merge_results
+from argus_qa.results import merge_results, partial_results
 
 PLAN = """# Plan
 
@@ -196,6 +196,58 @@ async def test_runs_persist_and_interrupted_runs_marked(tmp_path, fake_execute):
     assert run["status"] == "error"
     assert "restarted" in run["error"]
     fake_execute.gate.set()
+
+
+@pytest.fixture
+def stalls_after_first_test(monkeypatch):
+    """A run that saves TC-001's result, as execute_plan does while it works, and then never ends."""
+    started = asyncio.Event()
+
+    async def execute_plan(plan, url, run_dir, **kwargs):
+        run_dir.mkdir(parents=True, exist_ok=True)
+        done = {"TC-001": {"id": "TC-001", "name": "Home loads", "status": "passed", "mode": "ai"}}
+        (run_dir / "results.json").write_text(json.dumps(partial_results(plan, done)))
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(server, "execute_plan", execute_plan)
+    return started
+
+
+async def test_cancelled_run_keeps_the_tests_that_finished(make_client, stalls_after_first_test):
+    async with make_client() as client:
+        run_id = (await client.post("/runs", json={"plan": PLAN})).json()["id"]
+        await stalls_after_first_test.wait()
+        live = (await client.get(f"/runs/{run_id}/results")).json()
+        assert live["partial"] is True and [r["id"] for r in live["results"]] == ["TC-001"]
+
+        await client.post(f"/runs/{run_id}/cancel")
+        run = await _wait_finished(client, run_id)
+        assert run["status"] == "cancelled"
+        assert run["summary"]["passed"] == 1 and run["summary"]["causes"] == {"not_reached": 1}
+        assert run["failed_ids"] == ["TC-002"]
+        results = (await client.get(f"/runs/{run_id}/results")).json()
+        assert "partial" not in results
+        assert results["results"][1]["cause"] == "not_reached"
+        assert "cancelled" in results["results"][1]["notes"]
+        assert "Not reached" in (await client.get(f"/runs/{run_id}/report")).text
+
+
+async def test_restart_keeps_the_tests_that_finished(tmp_path, stalls_after_first_test):
+    app = server.create_app(tmp_path)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as client:
+        run_id = (await client.post("/runs", json={"plan": PLAN})).json()["id"]
+        await stalls_after_first_test.wait()
+
+    app2 = server.create_app(tmp_path)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app2), base_url="http://t") as client:
+        run = (await client.get(f"/runs/{run_id}")).json()
+        results = (await client.get(f"/runs/{run_id}/results")).json()
+    assert run["status"] == "error" and run["summary"]["passed"] == 1
+    assert run["failed_ids"] == ["TC-002"]
+    assert "server restarted" in results["results"][1]["notes"]
+    for task in app.state.manager.tasks.values():
+        task.cancel()
 
 
 async def test_screenshot_path_traversal_rejected(make_client, fake_execute):
@@ -387,3 +439,23 @@ async def test_rerun_failed_and_all(make_client, fake_execute):
         resp = await client.post(f"/runs/{only_passing['id']}/rerun", json={"failed_only": True})
         assert resp.status_code == 409
     assert passed
+
+
+async def test_rerun_chosen_tests(make_client, fake_execute):
+    async with make_client() as client:
+        first = (await client.post("/runs", json={"plan": PLAN})).json()
+        await _wait_finished(client, first["id"])
+        # `only` picks the tests whatever their result, e.g. the ones a stopped run didn't reach
+        chosen = (await client.post(f"/runs/{first['id']}/rerun", json={"only": ["TC-001"]})).json()
+        assert chosen["test_ids"] == ["TC-001"]
+        await _wait_finished(client, chosen["id"])
+        resp = await client.post(f"/runs/{first['id']}/rerun", json={"only": ["TC-009"]})
+        assert resp.status_code == 422 and "TC-009" in resp.json()["detail"]
+
+
+async def test_web_ui_is_revalidated_by_browsers(make_client):
+    async with make_client() as client:
+        for path in ("/", "/static/app.js"):
+            response = await client.get(path)
+            assert response.status_code == 200
+            assert response.headers["cache-control"] == "no-cache"

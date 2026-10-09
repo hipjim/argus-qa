@@ -9,7 +9,7 @@ FROM node:22-bookworm-slim
 ARG PLAYWRIGHT_MCP_VERSION=0.0.82
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates \
+    && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # Browser system libraries (needs root)

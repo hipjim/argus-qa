@@ -126,6 +126,12 @@ def test_redactor(project):
     assert redact.data(data) == {"steps": [{"actual": f"typed {REDACTED}"}], "n": 3}
 
 
+def test_redactor_recognises_secrets_in_urls():
+    redact = Redactor(["p@ss/word 1"])
+    for encoded in ("p%40ss%2Fword%201", "p%40ss/word%201", "p%40ss%2Fword+1"):
+        assert redact(f"GET https://app.test/login?pw={encoded}: 401") == f"GET https://app.test/login?pw={REDACTED}: 401"
+
+
 async def test_execute_plan_uses_project_and_never_saves_secrets(project, tmp_path, monkeypatch):
     """Tester gets real credentials; results, report, and the reporter's prompt never contain them."""
     prompts = []

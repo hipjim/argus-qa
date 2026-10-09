@@ -11,6 +11,7 @@ import random
 import re
 import shlex
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,9 +32,9 @@ from claude_agent_sdk import (
 )
 
 from argus_qa import colors as c
-from argus_qa.events import describe_tool, emit
-from argus_qa.plan_parser import TestCase, TestPlan, compose_plan, parse_test_plan
-from argus_qa.project import Project, Redactor, substitute
+from argus_qa.events import describe_tool, element_from_result, emit, name_element
+from argus_qa.plan_parser import TestCase, TestPlan, case_fields, compose_plan, parse_test_plan
+from argus_qa.project import Project, Redactor, restore_placeholders, substitute
 from argus_qa.prompts.bug_hunter import BUG_HUNTER_PROMPT
 from argus_qa.prompts.drafter import DRAFTER_PROMPT
 from argus_qa.prompts.explorer import EXPLORER_PROMPT
@@ -42,18 +43,36 @@ from argus_qa.prompts.reporter import REPORTER_PROMPT
 from argus_qa.prompts.scaffold import SCAFFOLD_PROMPT
 from argus_qa.prompts.tester import RECORDING_INSTRUCTIONS, TESTER_PROMPT
 from argus_qa.results import (
+    STATUSES,
+    TESTER_CAUSES,
     bugs_to_cases,
+    causes_line,
+    close_partial,
     discovery_report,
     exploration_report,
     extract_json,
     merge_results,
+    partial_results,
+    report_problem,
+    reported_result,
     script_result,
     summarize,
     test_report,
     to_junit,
 )
 from argus_qa.results import failed_ids as _failed_ids
-from argus_qa.scripts import CHECK_KINDS, RecordedTest, Recorder, build_script, ensure_runner, replay
+from argus_qa.scripts import (
+    ARGUS_TOOL,
+    CHECK_KINDS,
+    RecordedTest,
+    Recorder,
+    RunnerError,
+    build_script,
+    check_problem,
+    content_text,
+    ensure_runner,
+    replay,
+)
 
 AGENT_NAMES = [
     "Chad the Clicker",
@@ -194,8 +213,69 @@ _CHECK_SCHEMA = {
 }
 
 
-def _argus_tools():
-    """In-process tools the tester uses to mark tests, steps, and checks while recording."""
+_TEXT_LIST = {"type": "array", "items": {"type": "string"}}
+_REPORT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "test_id": {"type": "string", "description": "The test case ID, e.g. TC-003"},
+        "status": {"type": "string", "enum": list(STATUSES)},
+        "steps": {
+            "type": "array",
+            "description": "What happened at each step",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "step": {"type": "string", "description": "What was done"},
+                    "expected": {"type": "string"},
+                    "actual": {"type": "string"},
+                    "status": {"type": "string", "enum": ["passed", "failed"]},
+                    "screenshot": {"type": "string", "description": "Filename, e.g. TC-003_step2.png"},
+                },
+                "required": ["step", "status"],
+            },
+        },
+        "notes": {"type": "string", "description": "Anything extra observed"},
+        "cause": {"type": "string", "enum": list(TESTER_CAUSES), "description": "Failed and blocked tests"},
+        "evidence": {
+            "type": "object",
+            "description": "Console errors and failed requests related to the failure",
+            "properties": {"console": _TEXT_LIST, "network": _TEXT_LIST},
+        },
+        "bug": {
+            "type": "object",
+            "description": "Cause `bug` only: the bug, for the developers",
+            "properties": {
+                "title": {"type": "string"},
+                "severity": {"type": "string", "enum": ["critical", "high", "medium", "low"]},
+                "steps_to_reproduce": _TEXT_LIST,
+                "expected": {"type": "string"},
+                "actual": {"type": "string"},
+                "screenshot": {"type": "string"},
+            },
+            "required": ["title"],
+        },
+        "update": {
+            "type": "object",
+            "description": "Only when the test's wording no longer matches the app: all of its "
+                           "steps and acceptance criteria as they should read now",
+            "properties": {"steps": _TEXT_LIST, "expected": _TEXT_LIST},
+        },
+    },
+    "required": ["test_id", "status"],
+}
+
+
+def _argus_tools(record: bool = False):
+    """In-process tools for the tester: `report_test` hands in each test's result as soon as it
+    has one; while recording, the others mark tests, steps, and checks."""
+
+    @tool("report_test", "Hand in one test case's result as soon as you finish it, before the next test.",
+          _REPORT_SCHEMA)
+    async def report_test(args):
+        problem = report_problem(args)
+        if problem:
+            return _tool_text(problem, error=True)
+        return _tool_text(f"Saved the result of {args['test_id']}. Go on with the next test.")
 
     @tool("start_test", "Call at the very start of each test case, before resetting the browser.",
           {"test_id": str})
@@ -210,16 +290,11 @@ def _argus_tools():
     @tool("check", "Record one acceptance criterion that holds, as something a script can verify later.",
           _CHECK_SCHEMA)
     async def check(args):
-        kind = args.get("kind")
-        needs = {"text_visible": "text", "text_hidden": "text", "element_visible": "role",
-                 "url_contains": "value", "field_value": "label"}.get(kind)
-        if kind not in CHECK_KINDS:
-            return _tool_text(f"Unknown kind {kind!r}; use one of {', '.join(CHECK_KINDS)}.", error=True)
-        if needs and not args.get(needs):
-            return _tool_text(f"A {kind} check needs `{needs}`.", error=True)
-        return _tool_text("Recorded.")
+        problem = check_problem(args)
+        return _tool_text(problem, error=True) if problem else _tool_text("Recorded.")
 
-    return create_sdk_mcp_server(name="argus", tools=[start_test, start_step, check])
+    recording = [start_test, start_step, check] if record else []
+    return create_sdk_mcp_server(name="argus", tools=[report_test, *recording])
 
 
 def _browser_options(
@@ -231,24 +306,26 @@ def _browser_options(
     model: str | None = None,
     images: bool = True,
     snapshots: bool = True,
+    tester: bool = False,
     record: bool = False,
 ) -> ClaudeAgentOptions:
     """Options for agents that need browser access.
 
     With an output_dir, the agent (and so its browser) also runs from that
     directory: Playwright MCP resolves explicit screenshot filenames against its
-    working directory, while --output-dir only covers auto-named files.
+    working directory, while --output-dir only covers auto-named files. A tester
+    also gets the `argus` tools: `report_test`, and with record the recording ones.
     """
     servers = _make_playwright_mcp(
         headless=headless, isolated=isolated, output_dir=output_dir, images=images, snapshots=snapshots,
     )
-    if record:
-        servers["argus"] = _argus_tools()
+    if tester:
+        servers["argus"] = _argus_tools(record)
     return ClaudeAgentOptions(
         mcp_servers=servers,
         model=model,
         tools=[],
-        allowed_tools=["mcp__playwright__*", *(["mcp__argus__*"] if record else [])],
+        allowed_tools=["mcp__playwright__*", *(["mcp__argus__*"] if tester else [])],
         cwd=str(output_dir.resolve()) if output_dir is not None else None,
         max_budget_usd=max_budget_usd,
         max_turns=max_turns,
@@ -275,6 +352,11 @@ class AgentRun:
     turns: int = 0
     models: list[str] = field(default_factory=list)
     recording: dict[str, RecordedTest] | None = None
+    # Testers: the tests this agent was given, the results it handed in with `report_test`
+    # (test ID -> entry, in the order they came), and why it stopped early, if it did
+    case_ids: list[str] = field(default_factory=list)
+    reported: dict[str, dict] = field(default_factory=dict)
+    stop: str | None = None
 
 
 def _models(runs: list[AgentRun]) -> list[str]:
@@ -288,12 +370,17 @@ async def _run_agent(
     label: str = "",
     redact: Redactor | None = None,
     recorder: Recorder | None = None,
+    on_report: Callable[[dict, str], dict | None] | None = None,
 ) -> AgentRun:
     """Run a single agent query and return its final result, with secrets redacted.
 
-    A recorder, if given, sees every tool call and result (for recording scripts)."""
+    A recorder, if given, sees every tool call and result (for recording scripts).
+    on_report gets each `report_test` call (and the agent's name) as it happens, and
+    returns the results entry to keep for it, or None to leave it out."""
     redact = redact or Redactor()
     run = AgentRun(text="", ok=False)
+    # tool id -> an action waiting for its result, whose Playwright code names the element
+    unnamed: dict[str, tuple[str, str, dict]] = {}
     async for message in query(prompt=prompt, options=options):
         if isinstance(message, AssistantMessage):
             for block in message.content:
@@ -312,14 +399,29 @@ async def _run_agent(
                 elif isinstance(block, ToolUseBlock):
                     if recorder is not None:
                         recorder.on_tool_use(block.id, block.name, block.input)
-                    if block.name.startswith("mcp__argus__"):
+                    if block.name == ARGUS_TOOL + "report_test" and on_report is not None:
+                        entry = on_report(block.input if isinstance(block.input, dict) else {}, label)
+                        if entry:
+                            run.reported[entry["id"]] = entry
+                    if block.name.startswith(ARGUS_TOOL):
                         continue
                     tool_name, text, extra = describe_tool(block.name, block.input)
-                    emit("action", redact(text), agent=label, tool=tool_name, **extra)
-        elif isinstance(message, UserMessage) and recorder is not None:
+                    if extra.pop("unnamed", False):
+                        unnamed[block.id] = (tool_name, text, extra)
+                    else:
+                        emit("action", redact(text), agent=label, tool=tool_name, **extra)
+        elif isinstance(message, UserMessage):
             for block in message.content if isinstance(message.content, list) else []:
-                if isinstance(block, ToolResultBlock):
+                if not isinstance(block, ToolResultBlock):
+                    continue
+                if recorder is not None:
                     recorder.on_tool_result(block.tool_use_id, block.content, block.is_error)
+                if block.tool_use_id in unnamed:
+                    tool_name, text, extra = unnamed.pop(block.tool_use_id)
+                    element = element_from_result(content_text(block.content))
+                    if element:
+                        text = name_element(text, element)
+                    emit("action", redact(text), agent=label, tool=tool_name, **extra)
         elif isinstance(message, ResultMessage):
             run.cost_usd = message.total_cost_usd or 0.0
             run.turns = message.num_turns
@@ -332,6 +434,7 @@ async def _run_agent(
                 print(c.error(f"  Agent stopped: {reason}"))
                 emit("error", f"Stopped early: {reason}", agent=label)
                 run.text = f"Agent error: {message.subtype}"
+                run.stop = _STOP_REASONS.get(message.subtype) or f"stopped with {message.subtype}"
     return run
 
 
@@ -723,17 +826,23 @@ async def run_tests(
     timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     run_dir = Path(output_dir) / site_dir_name(url) / timestamp
 
-    result = await execute_plan(
-        plan,
-        url,
-        run_dir,
-        parallel=parallel,
-        headless=headless,
-        screenshot_dir=Path(screenshot_dir) if screenshot_dir else None,
-        project=project,
-        max_cost_usd=max_cost_usd,
-        ai_report=ai_report,
-    )
+    try:
+        result = await execute_plan(
+            plan,
+            url,
+            run_dir,
+            parallel=parallel,
+            headless=headless,
+            screenshot_dir=Path(screenshot_dir) if screenshot_dir else None,
+            project=project,
+            max_cost_usd=max_cost_usd,
+            ai_report=ai_report,
+        )
+    except asyncio.CancelledError:
+        # Ctrl-C: the tests that finished keep their results
+        if close_run_results(run_dir, plan, url, "The run was interrupted before this test finished."):
+            print(c.warn(f"\n  Interrupted. The results so far are in {run_dir}"))
+        raise
     if result.environment_error:
         raise RuntimeError(
             f"The browser couldn't run the tests: {result.environment_error}\n"
@@ -756,6 +865,78 @@ RUN_MODES = ("ai", "script", "auto")
 
 def _n(count: int, word: str) -> str:
     return f"{count} {word}{'' if count == 1 else 's'}"
+
+
+def _write_json(path: Path, data: dict) -> None:
+    """Replace the file in one step: the server may be reading it while a run rewrites it."""
+    scratch = path.with_name(path.name + ".tmp")
+    scratch.write_text(json.dumps(data, indent=2))
+    scratch.replace(path)
+
+
+def _ai_entry(result: dict, failure: dict | None) -> dict:
+    """The results entry for a test the AI ran. `failure` is the entry of its script's failed
+    replay, if it had one: an AI pass after that means the test was healed."""
+    entry = {**result, "mode": "ai"}
+    if failure and entry["status"] == "passed":
+        entry["healed"] = True
+        entry["notes"] = (
+            f"Healed: the recorded script failed ({failure['notes']}), but the AI completed "
+            f"the test, so the page probably changed. {entry.get('notes') or ''}"
+        ).strip()
+    elif failure:
+        entry["notes"] = (
+            f"The recorded script failed too: {failure['notes']}. {entry.get('notes') or ''}"
+        ).strip()
+        if not entry.get("evidence") and failure.get("evidence"):
+            entry["evidence"] = failure["evidence"]
+    return entry
+
+
+def _proposed_update(case: TestCase, update: dict, project: Project | None) -> dict | None:
+    """The tester's corrected wording for a test (steps, expected), kept only where it differs
+    from the test. The tester read the plan with the project's values filled in, so the
+    test's {{placeholders}} are put back."""
+    fields = case_fields(case)
+    changed = {}
+    for key, lines in update.items():
+        lines = [restore_placeholders(line, case.raw_markdown, project) for line in lines]
+        if lines != [" ".join(line.split()) for line in fields[key]]:
+            changed[key] = lines
+    return changed or None
+
+
+def _not_reached(runs: list[AgentRun]) -> dict[str, str]:
+    """Test ID -> why it has no result, for the tests of agents that stopped early."""
+    notes = {}
+    for run in runs:
+        if not run.stop:
+            continue
+        last = next(reversed(run.reported), None)
+        after = f" after {last}" if last else ""
+        for test_id in run.case_ids:
+            if test_id not in run.reported:
+                notes[test_id] = f"The run stopped before this test finished: the agent {run.stop}{after}."
+    return notes
+
+
+def close_run_results(run_dir: Path, plan: TestPlan, url: str, why: str) -> dict | None:
+    """Complete the saved results of a run that stopped part-way (cancelled, crashed, or the
+    server restarted): the tests it finished keep their results, the rest are marked not
+    reached with `why` as their note. Returns the completed results, or None when the run
+    saved none or had finished."""
+    path = run_dir / "results.json"
+    try:
+        partial = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(partial, dict) or not partial.get("partial"):
+        return None
+    closed = close_partial(partial, plan, why)
+    _write_json(path, closed)
+    (run_dir / "junit.xml").write_text(to_junit(closed))
+    (run_dir / "report.md").write_text(test_report(closed, plan, url))
+    return closed
 
 
 async def execute_plan(
@@ -803,6 +984,17 @@ async def execute_plan(
     print(f"\n  {c.BOLD}{total}{c.RESET} test cases selected: {c.DIM}{case_ids}{c.RESET}")
     print(f"  Screenshots {c.DIM}→{c.RESET} {c.info(str(ss_dir))}")
 
+    # Each test's result is saved as soon as there is one, so a run that is cancelled, crashes
+    # or reaches its cost limit keeps what it finished (close_run_results completes the file)
+    done: dict[str, dict] = {}
+
+    def save_progress(entry: dict | None = None) -> None:
+        if entry:
+            done[entry["id"]] = entry
+        _write_json(run_dir / "results.json", redact.data(partial_results(plan, done)))
+
+    save_progress()
+
     # ── Scripts first (no AI) ───────────────────────────────────
     script_passed: dict[str, dict] = {}
     script_failed: dict[str, dict] = {}
@@ -812,18 +1004,48 @@ async def execute_plan(
         if to_replay:
             print(c.phase(1, 2, f"Replaying {len(to_replay)} recorded script(s) without AI..."))
             emit("phase", f"Replaying {_n(len(to_replay), 'recorded script')} without AI")
-            runner = await asyncio.to_thread(ensure_runner)
-            replayed = await replay(to_replay, url, values, ss_dir, runner)
+            # What the runner reports is redacted as it arrives, before any of it is shortened
+            # for display: a cut through a secret would leave part of it behind
+            try:
+                runner = await asyncio.to_thread(ensure_runner)
+                replayed = redact.data(await replay(to_replay, url, values, ss_dir, runner))
+            except RunnerError as e:
+                if mode == "script":
+                    raise
+                # Auto mode still has the AI
+                print(c.warn(f"  {e}\n  Running these tests with AI instead."))
+                emit("error", f"{e} Running these tests with AI instead.")
+                replayed = {}
+            # A failed script gets one more try before anything else: it costs nothing, and a
+            # test that passes the second time is flaky rather than broken
+            retry = {tid: to_replay[tid] for tid, r in replayed.items() if r.get("status") != "passed"}
+            retried = {}
+            if retry:
+                emit("phase", f"Retrying {_n(len(retry), 'failed script')}")
+                try:
+                    retried = redact.data(await replay(retry, url, values, ss_dir, runner))
+                except RunnerError as e:
+                    emit("error", f"The retry didn't run, so the first results stand. {e}")
             for tc in plan.cases:
                 if tc.id not in replayed:
                     continue
-                entry = script_result(tc, replayed[tc.id])
-                seconds = replayed[tc.id].get("duration_ms", 0) / 1000
+                first = script_result(tc, replayed[tc.id])
+                again = retried.get(tc.id)
+                entry = script_result(tc, again) if again else first
+                seconds = (again or replayed[tc.id]).get("duration_ms", 0) / 1000
                 if entry["status"] == "passed":
+                    if again:
+                        entry["flaky"] = True
+                        why = first["notes"][:1].lower() + first["notes"][1:]
+                        entry["notes"] = f"Flaky: passed on the second try. The first try {why}"
                     script_passed[tc.id] = entry
-                    emit("phase", f"{tc.id} passed by script in {seconds:.1f}s")
+                    save_progress(entry)
+                    retried_note = " (on retry)" if again else ""
+                    emit("phase", f"{tc.id} passed by script in {seconds:.1f}s{retried_note}")
                 else:
                     script_failed[tc.id] = entry
+                    if mode == "script":  # in Auto the AI has yet to look at it
+                        save_progress(entry)
                     emit("error", f"{tc.id} script failed: {entry['notes']}")
 
     if mode == "script":
@@ -840,11 +1062,32 @@ async def execute_plan(
         ai_plan = TestPlan(raw=plan.raw, url=plan.url, preamble=plan.preamble, cases=ai_cases)
         if script_failed and mode == "auto":
             emit("phase", f"Healing {_n(len(script_failed), 'test')} with AI")
+        ai_by_key = {tc.id.upper(): tc for tc in ai_cases}
+
+        def on_report(report: dict, agent: str) -> dict | None:
+            """Keep the result a tester just handed in for one of its tests."""
+            entry = reported_result(report)
+            tc = ai_by_key.get(entry["id"]) if entry else None
+            if tc is None:
+                return None
+            entry = {**entry, "id": tc.id, "name": entry["name"] or tc.name}
+            update = _proposed_update(tc, entry.pop("update", {}), project)
+            if update:
+                entry["update"] = update
+            entry = redact.data(entry)
+            save_progress(_ai_entry(entry, script_failed.get(tc.id)))
+            print(c.agent_line(agent, f"{tc.id}: {entry['status']}"))
+            emit("result", f"{tc.id} {entry['status']}", agent=agent, test=tc.id, status=entry["status"])
+            return entry
+
         runs = await _run_testers(
             ai_plan, url, ss_dir, parallel=parallel, headless=headless, isolated=isolated, project=project,
-            redact=redact, budget=_share(max_cost_usd, tester_share), record=record,
+            redact=redact, budget=_share(max_cost_usd, tester_share), record=record, on_report=on_report,
         )
-        ai_merged = merge_results([r.text for r in runs], ai_plan)
+        reported = {test_id: entry for run in runs for test_id, entry in run.reported.items()}
+        ai_merged = merge_results(
+            [r.text for r in runs], ai_plan, reported=reported, not_reached=_not_reached(runs),
+        )
 
     # Page snapshots and other text the browser saved can contain secrets shown or typed on the page
     _redact_text_files(ss_dir, redact)
@@ -855,24 +1098,13 @@ async def execute_plan(
         if tc.id in script_passed:
             results.append(script_passed[tc.id])
         elif tc.id in ai_by_id:
-            entry = {**ai_by_id[tc.id], "mode": "ai"}
-            failure = script_failed.get(tc.id)
-            if failure and entry["status"] == "passed":
-                entry["healed"] = True
-                entry["notes"] = (
-                    f"Healed: the recorded script failed ({failure['notes']}), but the AI completed "
-                    f"the test, so the page probably changed. {entry.get('notes') or ''}"
-                ).strip()
-            elif failure:
-                entry["notes"] = (
-                    f"The recorded script failed too: {failure['notes']}. {entry.get('notes') or ''}"
-                ).strip()
-            results.append(entry)
+            results.append(_ai_entry(ai_by_id[tc.id], script_failed.get(tc.id)))
         elif tc.id in script_failed:
             results.append(script_failed[tc.id])
         else:
             results.append({
-                "id": tc.id, "name": tc.name, "status": "blocked", "mode": "script", "steps": [],
+                "id": tc.id, "name": tc.name, "status": "blocked", "mode": "script", "cause": "outdated",
+                "steps": [],
                 "notes": "No script is recorded for this test yet. Run it with AI or Auto to record one.",
             })
 
@@ -888,7 +1120,7 @@ async def execute_plan(
         recorded = await _record_scripts(plan, runs, results, url, project, run_dir)
 
     merged = redact.data(merged)
-    (run_dir / "results.json").write_text(json.dumps(merged, indent=2))
+    _write_json(run_dir / "results.json", merged)
     (run_dir / "junit.xml").write_text(to_junit(merged))
     print(c.success("\n  Tests complete.\n"))
 
@@ -905,7 +1137,11 @@ async def execute_plan(
     print(c.result_bar(summary["passed"], summary["failed"], summary["blocked"], summary["skipped"]))
     if summary.get("by_script"):
         how = f"{summary['by_script']} by script, {summary['by_ai']} by AI, {summary['healed']} healed"
+        if summary.get("flaky"):
+            how += f", {summary['flaky']} flaky"
         print(c.dim(f"  {how}"))
+    if causes_line(summary):
+        print(f"  Why tests failed: {c.BOLD}{causes_line(summary)}{c.RESET}")
 
     # ── Report ──────────────────────────────────────────────────
     agents = list(runs)
@@ -962,6 +1198,7 @@ async def _run_testers(
     redact: Redactor,
     budget: float | None,
     record: bool,
+    on_report: Callable[[dict, str], dict | None] | None = None,
 ) -> list[AgentRun]:
     """Run tester agents over the plan: one agent, or parallel agents on chunks of it."""
     used_names: set[str] = set()
@@ -979,7 +1216,7 @@ async def _run_testers(
         emit("phase", f"{tester_name} is running {total} test{'s' if total != 1 else ''}")
         return [await _run_test_chunk(
             url, plan, ss_dir, label=tester_name, headless=headless, isolated=isolated,
-            project=project, redact=redact, max_budget_usd=budget, record=record,
+            project=project, redact=redact, max_budget_usd=budget, record=record, on_report=on_report,
         )]
 
     chunks = plan.split_chunks(min(parallel, total))
@@ -995,7 +1232,7 @@ async def _run_testers(
         tasks.append(
             _run_test_chunk(
                 url, chunk, ss_dir, label=name, headless=True, isolated=True,
-                project=project, redact=redact, record=record,
+                project=project, redact=redact, record=record, on_report=on_report,
                 max_budget_usd=_share(budget, 1 / len(chunks)) if budget else None,
             )
         )
@@ -1039,8 +1276,15 @@ async def _record_scripts(
         return {}
 
     emit("phase", f"Checking {_n(len(drafts), 'recorded script')} by replaying them")
-    runner = await asyncio.to_thread(ensure_runner)
-    verified = await replay(drafts, url, values, run_dir / "verify", runner)
+    try:
+        runner = await asyncio.to_thread(ensure_runner)
+        verified = await replay(drafts, url, values, run_dir / "verify", runner)
+    except RunnerError as e:
+        # Scripts are a bonus; the run's results must not be lost over them
+        for tc_id in drafts:
+            status[tc_id]["script"] = f"not recorded: {e}"
+        emit("error", f"No scripts were recorded. {e}")
+        return {}
     recorded = {}
     for tc_id, path in drafts.items():
         result = verified.get(tc_id, {})
@@ -1079,12 +1323,14 @@ async def _run_test_chunk(
     redact: Redactor | None = None,
     max_budget_usd: float | None = None,
     record: bool = False,
+    on_report: Callable[[dict, str], dict | None] | None = None,
 ) -> AgentRun:
     """Run a chunk of test cases in one agent.
 
     Isolated agents get their own in-memory browser profile so multiple chunks
-    can run in parallel without conflicts. With record, the agent marks steps and
-    checks with the argus tools, and the run carries per-test recordings.
+    can run in parallel without conflicts. The agent hands in each test's result
+    with the argus `report_test` tool (on_report). With record, it also marks steps
+    and checks with the argus tools, and the run carries per-test recordings.
     """
     snapshots = tester_snapshots()
     prompt = TESTER_PROMPT.format(
@@ -1100,10 +1346,14 @@ async def _run_test_chunk(
         model=model_for("tester"),
         images=False,  # it reads the page as text; screenshots are evidence for people
         snapshots=snapshots,
+        tester=True,
         record=record,
     )
     recorder = Recorder() if record else None
-    run = await _run_agent(prompt, options, label=label, redact=redact, recorder=recorder)
+    run = await _run_agent(
+        prompt, options, label=label, redact=redact, recorder=recorder, on_report=on_report,
+    )
+    run.case_ids = [tc.id for tc in plan.cases]
     if recorder is not None:
         run.recording = recorder.tests()
     return run

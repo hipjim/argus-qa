@@ -2,7 +2,8 @@
 //
 // Reads a job from stdin:
 //   { base_url, values, screenshot_dir, headless, no_sandbox, tests: [{ id, file }] }
-// Writes { results: [{ id, status, steps, checks, error, failed_step, duration_ms }] } to stdout.
+// Writes { results: [{ id, status, steps, checks, error, failed_step, duration_ms,
+//                      console_errors, failed_requests }] } to stdout.
 // Each test gets a fresh browser context, so tests can't depend on each other.
 
 import { createRequire } from "node:module";
@@ -15,6 +16,7 @@ const { chromium } = require("playwright-core");
 const ACTION_TIMEOUT = 15_000;
 const NAVIGATION_TIMEOUT = 30_000;
 const CHECK_TIMEOUT = 8_000;
+const EVIDENCE_LIMIT = 10;
 
 const readStdin = async () => {
   let data = "";
@@ -51,7 +53,20 @@ async function runTest(browser, job, test) {
   const page = await context.newPage();
   page.setDefaultTimeout(ACTION_TIMEOUT);
   page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT);
-  const result = { id: test.id, status: "passed", steps: [], checks: [], error: null, failed_step: null };
+  const result = {
+    id: test.id, status: "passed", steps: [], checks: [], error: null, failed_step: null,
+    console_errors: [], failed_requests: [],
+  };
+  // Evidence for failures: what the page itself complained about. Kept whole: argus-qa shortens
+  // it after removing secrets, which it couldn't recognise in a URL that was cut through one
+  const note = (list, text) => { if (list.length < EVIDENCE_LIMIT) list.push(text); };
+  // "Failed to load resource" repeats what failed_requests already says, with less detail
+  page.on("console", (m) => {
+    if (m.type() === "error" && !m.text().startsWith("Failed to load resource")) note(result.console_errors, m.text());
+  });
+  page.on("pageerror", (e) => note(result.console_errors, `Uncaught ${summarize(e)}`));
+  page.on("requestfailed", (r) => note(result.failed_requests, `${r.method()} ${r.url()}: ${r.failure()?.errorText || "failed"}`));
+  page.on("response", (r) => { if (r.status() >= 400) note(result.failed_requests, `${r.request().method()} ${r.url()}: ${r.status()}`); });
   const started = Date.now();
   const shot = async (name) => {
     const path = join(job.screenshot_dir, `${test.id}_${name}.png`);

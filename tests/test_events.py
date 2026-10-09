@@ -61,3 +61,34 @@ def test_shorten_titles():
     assert _shorten("Explore: short", 90) == "Explore: short"
     long = "Explore: Try to break the login form with unusual input: empty fields, very long values, special characters"
     assert _shorten(long, 60) == "Explore: Try to break the login form with unusual input…"
+
+
+def _result(code):
+    return f"### Ran Playwright code\n```js\n{code}\n```\n\n### Page\n- Page URL: https://a.test/"
+
+
+def test_actions_without_a_description_are_named_from_their_code():
+    from argus_qa.events import element_from_result, name_element
+
+    tool, text, extra = describe_tool("mcp__playwright__browser_click", {"target": "f3e46"})
+    assert (text, extra) == ("Click", {"unnamed": True})
+    element = element_from_result(_result("await page.getByRole('button', { name: 'Sign in' }).click();"))
+    assert name_element(text, element) == 'Click: "Sign in" button'
+
+    _, text, _ = describe_tool("mcp__playwright__browser_type", {"target": "e5", "text": "AP 8"})
+    element = element_from_result(_result(
+        "await page.getByRole('row', { name: 'X' }).getByPlaceholder('Search campaigns').fill('AP 8');"))
+    assert name_element(text, element) == 'Type: "Search campaigns" field ← "AP 8"'
+
+    assert element_from_result(_result("await page.getByText('It\\'s here').click();")) == "\"It's here\""
+    assert element_from_result(_result("await page.locator('#save').click();")) == "#save"
+    assert element_from_result("### Error\nElement not found") == ""
+    # A selector the agent passed is readable as is
+    assert describe_tool("mcp__playwright__browser_click", {"target": "#save"})[1] == "Click: #save"
+
+
+def test_look_only_actions_are_quiet():
+    assert describe_tool("mcp__playwright__browser_snapshot", {})[2] == {"quiet": True}
+    tool, text, extra = describe_tool("mcp__playwright__browser_evaluate", {"function": "() => { return document.title; }"})
+    assert text == "Run script: document.title" and extra == {"quiet": True}
+    assert describe_tool("mcp__playwright__browser_navigate", {"url": "https://a.test"})[2] == {}
