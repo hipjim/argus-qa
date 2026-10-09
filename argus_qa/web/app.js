@@ -175,6 +175,7 @@ function openLightbox(src, caption) {
 }
 lightbox.addEventListener("click", (e) => { if (e.target === lightbox) lightbox.close(); });
 document.addEventListener("click", (e) => {
+  document.querySelectorAll("details.menu[open]").forEach((m) => { if (!m.contains(e.target)) m.removeAttribute("open"); });
   const img = e.target.closest(".thumb img, .ev-thumb, .prose img");
   if (img && img.src) {
     e.preventDefault();
@@ -195,6 +196,30 @@ keyDialog.addEventListener("close", () => {
   }
 });
 document.getElementById("key-btn").addEventListener("click", askForKey);
+
+// ── Theme ────────────────────────────────────────────────────────────
+// index.html sets data-theme before the page draws; this keeps it in step with the toggle
+// and, until someone picks one here, with the system setting.
+
+const THEME_STORAGE = "argus-theme";
+const themeBtn = document.getElementById("theme-btn");
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  const label = theme === "dark" ? "Switch to light theme" : "Switch to dark theme";
+  themeBtn.title = label;
+  themeBtn.setAttribute("aria-label", label);
+}
+applyTheme(document.documentElement.dataset.theme || "light");
+themeBtn.addEventListener("click", () => {
+  const theme = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  try { localStorage.setItem(THEME_STORAGE, theme); } catch { /* private mode */ }
+  applyTheme(theme);
+});
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
+  let picked = null;
+  try { picked = localStorage.getItem(THEME_STORAGE); } catch { /* private mode */ }
+  if (!picked) applyTheme(e.matches ? "dark" : "light");
+});
 
 // ── Router ───────────────────────────────────────────────────────────
 
@@ -1138,8 +1163,9 @@ async function runView(runId, alive) {
       actions.push(`<button class="btn btn-ghost btn-small btn-danger" data-act="delete">Delete</button>`);
     }
     if (results && !results.partial && !session) {
-      actions.push(`<button class="btn btn-ghost btn-small" data-act="dl-junit">junit.xml</button>`);
-      actions.push(`<button class="btn btn-ghost btn-small" data-act="dl-results">results.json</button>`);
+      actions.push(`<details class="menu"><summary class="btn btn-ghost btn-small">Download</summary><div class="menu-list">
+        <button type="button" data-act="dl-results">Results <span class="mono muted">.json</span></button>
+        <button type="button" data-act="dl-junit">JUnit <span class="mono muted">.xml</span></button></div></details>`);
     }
     $("#run-actions").innerHTML = actions.join("");
 
@@ -1177,6 +1203,7 @@ async function runView(runId, alive) {
   $("#run-actions").addEventListener("click", async (e) => {
     const act = e.target.closest("[data-act]")?.dataset.act;
     if (!act) return;
+    e.target.closest("details.menu")?.removeAttribute("open");
     try {
       if (act === "cancel") {
         run = await api(`/runs/${runId}/cancel`, { method: "POST" });
@@ -1682,7 +1709,6 @@ async function runView(runId, alive) {
     if (wasActive && !ACTIVE.has(run.status)) {
       reportHtml = null;
       proposed = null;
-      toast(`Run ${run.status}`);
     }
     return ACTIVE.has(run.status);
   };

@@ -215,6 +215,16 @@ def test_report_test_calls_are_checked():
     assert entry["update"] == {"steps": ["Click Sign in"]}
 
 
+def test_reported_notes_lose_a_stray_quote():
+    def note(text):
+        return reported_result({"test_id": "TC-001", "status": "failed", "notes": text})["notes"]
+
+    assert note('Stopped before the Finish step."') == "Stopped before the Finish step."
+    assert note('"Stopped early.') == "Stopped early."
+    assert note('The field showed "Hopper".') == 'The field showed "Hopper".'
+    assert note("The users' list was empty'") == "The users' list was empty'"
+
+
 def test_partial_results_are_completed_when_a_run_stops():
     done = {"TC-002": {"id": "TC-002", "name": "Case 2", "status": "failed", "cause": "bug",
                        "bug": {"title": "Broken"}}}

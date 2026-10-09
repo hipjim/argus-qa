@@ -77,6 +77,17 @@ def report_problem(report: dict) -> str | None:
     return None
 
 
+def _trim_quotes(text: str) -> str:
+    """Text without a double quote left unpaired at its start or end (models sometimes leave one)."""
+    text = text.strip()
+    if text.count('"') % 2:
+        if text.endswith('"'):
+            text = text[:-1].rstrip()
+        elif text.startswith('"'):
+            text = text[1:].lstrip()
+    return text
+
+
 def reported_result(report: dict) -> dict | None:
     """A results entry from one `report_test` call, or None if the call was turned down.
 
@@ -90,7 +101,7 @@ def reported_result(report: dict) -> dict | None:
         "name": str(report.get("name") or ""),
         "status": str(report["status"]).lower(),
         "steps": [s for s in report.get("steps") or [] if isinstance(s, dict)],
-        "notes": str(report.get("notes") or ""),
+        "notes": _trim_quotes(str(report.get("notes") or "")),
         "cause": report.get("cause"),
         "evidence": report.get("evidence"),
     }
