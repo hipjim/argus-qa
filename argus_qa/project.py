@@ -31,6 +31,7 @@ import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import quote, quote_plus
 
 PROJECT_FILE = "argus.toml"
 MASK = "********"
@@ -44,6 +45,8 @@ _FIELDS = {"name", "slug", "url", "description", "instructions", "credentials", 
 _CREDENTIAL_FIELDS = {"username", "password", "notes"}
 # Secrets shorter than this aren't redacted from output; they'd mangle unrelated text
 _MIN_REDACT_LEN = 4
+# Values shorter than this aren't turned back into {{placeholders}}; they match too much
+_MIN_RESTORE_LEN = 3
 
 
 def slugify(name: str) -> str:
@@ -179,6 +182,17 @@ class Project:
         values = [c.password for c in self.credentials.values()] + list(self.secrets.values())
         return [v for v in values if v]
 
+    def placeholder_values(self) -> dict[str, str]:
+        """Every {{name}} this project defines, with its value."""
+        values = {}
+        for role, cred in self.credentials.items():
+            values[f"{role}.username"] = cred.username
+            values[f"{role}.password"] = cred.password
+        return {**values, **self.variables, **self.secrets}
+
+    def secret_placeholders(self) -> set[str]:
+        return {f"{role}.password" for role in self.credentials} | set(self.secrets)
+
     def lookup(self, name: str) -> str | None:
         """Resolve a {{placeholder}} name: role.username / role.password / variable / secret."""
         if "." in name:
@@ -232,11 +246,31 @@ def substitute(text: str, project: Project | None) -> str:
     return _PLACEHOLDER.sub(lambda m: project.lookup(m.group(1)) or "", text)
 
 
+def restore_placeholders(text: str, template: str, project: Project | None) -> str:
+    """The opposite of substitute(), for text an agent wrote after reading the substituted
+    `template`: wherever `text` shows the value of a placeholder the template uses, put the
+    {{placeholder}} back. Only the template's own placeholders are restored, so a word that
+    happens to equal some other project value is left alone."""
+    if project is None:
+        return text
+    names = {m.group(1) for m in _PLACEHOLDER.finditer(template)}
+    values = sorted(((project.lookup(n) or "", n) for n in names), key=lambda v: len(v[0]), reverse=True)
+    for value, name in values:
+        if len(value) >= _MIN_RESTORE_LEN:
+            text = text.replace(value, "{{" + name + "}}")
+    return text
+
+
 class Redactor:
     """Removes secret values from text and JSON-like data before it's printed or saved."""
 
     def __init__(self, secrets: list[str] | None = None):
-        self.values = sorted({s for s in secrets or [] if len(s) >= _MIN_REDACT_LEN}, key=len, reverse=True)
+        found = set()
+        for secret in secrets or []:
+            if len(secret) >= _MIN_REDACT_LEN:
+                # Also as it appears in a URL, e.g. in a failed request kept as evidence
+                found.update({secret, quote(secret, safe=""), quote(secret), quote_plus(secret)})
+        self.values = sorted(found, key=len, reverse=True)
 
     def __call__(self, text: str) -> str:
         for value in self.values:

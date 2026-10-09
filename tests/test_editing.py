@@ -8,7 +8,14 @@ import pytest
 
 from argus_qa import server
 from argus_qa.agents import orchestrator
-from argus_qa.plan_parser import case_fields, parse_test_plan, plan_fields, render_case, render_plan
+from argus_qa.plan_parser import (
+    case_fields,
+    parse_test_plan,
+    plan_fields,
+    render_case,
+    render_plan,
+    replace_case,
+)
 from argus_qa.project import Project
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "testplan_example.md"
@@ -153,3 +160,18 @@ async def test_draft_failure(monkeypatch):
     monkeypatch.setattr(orchestrator, "_run_agent", junk)
     with pytest.raises(RuntimeError, match="Couldn't draft"):
         await orchestrator.draft_test_case("x y z")
+
+
+def test_replace_case_leaves_the_rest_of_the_plan_alone():
+    text = (
+        "# Test Plan: Shop\n\n## Test Cases\n\n"
+        "### TC-001: Log in\n\n1. Log in as {{admin.username}}\n\n---\n\n"
+        "### TC-002: Create a promotion\n\n**Steps:**\n1. Click New promotion\n\n---\n\n"
+        "### TC-003: Delete it\n\n1. Click Delete\n"
+    )
+    case = parse_test_plan(text).cases[1]
+    updated = replace_case(text, case, {**case_fields(case), "steps": ["Click Create promotion"]})
+    assert updated == text.replace("Click New promotion", "Click Create promotion")
+    before, after = parse_test_plan(text).cases, parse_test_plan(updated).cases
+    assert [c.raw_markdown for c in after[::2]] == [c.raw_markdown for c in before[::2]]
+    assert after[1].id == "TC-002" and "Create promotion" in after[1].raw_markdown

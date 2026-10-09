@@ -9,7 +9,7 @@ FROM node:22-bookworm-slim
 ARG PLAYWRIGHT_MCP_VERSION=0.0.82
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates \
+    && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # Browser system libraries (needs root)
@@ -23,10 +23,13 @@ RUN useradd --create-home --shell /bin/bash argus \
 USER argus
 WORKDIR /home/argus
 
-# Warm the npx cache and download the browser build this MCP version expects
+# Warm the npx cache, download the browser build this MCP version expects, and install the
+# same Playwright version for the script runner (replays recorded tests without AI)
 RUN npx -y "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" --version \
     && cd "$(dirname "$(find ~/.npm/_npx -path '*/node_modules/playwright-core/package.json' | head -1)")" \
-    && node cli.js install chromium
+    && node cli.js install chromium \
+    && npm install --prefix ~/.cache/argus-qa/runner --no-save --no-audit --no-fund \
+       "playwright-core@$(node -p "require('./package.json').version")"
 
 COPY --chown=argus:argus pyproject.toml README.md ./app/
 COPY --chown=argus:argus argus_qa ./app/argus_qa

@@ -248,10 +248,9 @@ window.addEventListener("hashchange", route);
 
 async function runsView(params, alive) {
   const project = params.get("project") || "";
-  const [runs, projects] = await Promise.all([
-    api(`/runs?limit=200${project ? `&project=${encodeURIComponent(project)}` : ""}`),
-    api("/projects"),
-  ]);
+  const schedule = params.get("schedule") || "";
+  const query = `/runs?limit=200${project ? `&project=${encodeURIComponent(project)}` : ""}${schedule ? `&schedule=${encodeURIComponent(schedule)}` : ""}`;
+  const [runs, projects] = await Promise.all([api(query), api("/projects")]);
   if (!alive()) return;
 
   const options = projects.map((p) => `<option value="${esc(p.slug)}" ${p.slug === project ? "selected" : ""}>${esc(p.name)}</option>`).join("");
@@ -267,6 +266,7 @@ async function runsView(params, alive) {
       <label class="sr-only" for="project-filter">Project</label>
       <select id="project-filter"><option value="">All projects</option>${options}</select>
       <span class="muted small" id="run-count"></span>
+      ${schedule ? `<span class="small">Started by the schedule <b>${esc(schedule)}</b> · <a href="#/runs${project ? `?project=${encodeURIComponent(project)}` : ""}">show all</a></span>` : ""}
       <span class="spacer"></span>
       <button class="btn btn-small btn-danger" id="delete-selected" hidden></button>
     </div>
@@ -354,7 +354,7 @@ async function runsView(params, alive) {
           <td class="check"><input type="checkbox" value="${esc(r.id)}" ${selected.has(r.id) ? "checked" : ""}
             ${ACTIVE.has(r.status) ? 'disabled title="Cancel it first"' : ""} aria-label="Select run ${esc(r.id)}"></td>
           <td>${statusBadge(r.status)}</td>
-          <td><a class="row-link" href="#/runs/${esc(r.id)}"><div class="title">${r.kind !== "test" ? `<span class="kind ${esc(r.kind)}">${r.kind === "discover" ? "Discover" : "Explore"}</span>` : ""}${esc(r.kind !== "test" ? (r.brief || "Whole app") : (r.title || r.test_ids.join(", ")))}</div>
+          <td><a class="row-link" href="#/runs/${esc(r.id)}"><div class="title">${r.kind !== "test" ? `<span class="kind ${esc(r.kind)}">${r.kind === "discover" ? "Discover" : "Explore"}</span>` : ""}${r.schedule ? `<span class="kind scheduled" title="Started by the schedule ${esc(r.schedule)}">Scheduled</span>` : ""}${esc(r.kind !== "test" ? (r.brief || "Whole app") : (r.title || r.test_ids.join(", ")))}</div>
             <div class="id">${esc(r.id)} · ${esc(new URL(r.url).host)}</div></a></td>
           <td class="hide-sm">${r.project ? esc(names[r.project] || r.project) : '<span class="muted">—</span>'}</td>
           <td>${r.kind !== "test" ? `<span class="small">${sessionOutcome(r)}</span>` : r.summary ? `<div style="display:grid;gap:6px">${tallyBar(r.summary)}${tally(r.summary)}</div>`
@@ -380,9 +380,107 @@ async function runsView(params, alive) {
 
   draw(runs);
   every(async () => {
-    const fresh = await api(`/runs?limit=200${project ? `&project=${encodeURIComponent(project)}` : ""}`).catch(() => null);
+    const fresh = await api(query).catch(() => null);
     if (fresh && alive()) draw(fresh);
   }, LIST_POLL_MS);
+}
+
+// ── Failure causes ────────────────────────────────────────────────────
+
+// Why a test failed: [badge, explanation, one, many]
+const CAUSES = {
+  bug: ["App bug", "The app doesn't do what the test expects: the app needs fixing", "app bug", "app bugs"],
+  outdated: ["Test needs updating", "The app works, but differently from what the test describes",
+    "test needs updating", "tests need updating"],
+  environment: ["Environment", "Something outside the feature got in the way: the site was down, an account or test data was missing",
+    "environment problem", "environment problems"],
+  unknown: ["Cause unclear", "It isn't clear whether the app or the test is at fault. A script can't tell a bug from a changed page: let the AI look",
+    "unclear", "unclear"],
+  not_reached: ["Not reached", "The run stopped before this test finished: it was cancelled, or reached its cost or turn limit",
+    "not reached", "not reached"],
+};
+const causeLabel = (k, n) => CAUSES[k]?.[n === 1 ? 2 : 3] || k;
+
+// The difference between two short lists of lines: [kind, text], kind being same | del | add
+function diffLines(before, after) {
+  const n = before.length;
+  const m = after.length;
+  const common = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      common[i][j] = before[i] === after[j] ? common[i + 1][j + 1] + 1 : Math.max(common[i + 1][j], common[i][j + 1]);
+    }
+  }
+  const out = [];
+  let i = 0;
+  let j = 0;
+  while (i < n || j < m) {
+    if (i < n && j < m && before[i] === after[j]) { out.push(["same", before[i]]); i++; j++; }
+    else if (i < n && (j === m || common[i + 1][j] >= common[i][j + 1])) out.push(["del", before[i++]]);
+    else out.push(["add", after[j++]]);
+  }
+  return out;
+}
+
+async function copyText(text, done) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(done);
+  } catch {
+    toast("Couldn't copy: the browser blocked access to the clipboard", true);
+  }
+}
+
+// ── Run modes & scripts ──────────────────────────────────────────────
+
+const RUN_MODES = [
+  ["auto", "Auto", "Replay recorded scripts without AI; the AI steps in only for tests without a script or whose script fails, and re-records them."],
+  ["script", "Script only", "Replay recorded scripts only: no AI, no cost. Tests without a script are blocked."],
+  ["ai", "AI", "Run every test with AI, and re-record their scripts."],
+];
+const MODE_LABEL = Object.fromEntries(RUN_MODES.map(([k, label]) => [k, label]));
+
+function modeSelect(name, value = "auto") {
+  return `<select name="${name}" aria-label="How to run">${RUN_MODES.map(([k, label]) =>
+    `<option value="${k}" ${k === value ? "selected" : ""}>${label}</option>`).join("")}</select>`;
+}
+const modeDescription = (k) => (RUN_MODES.find(([m]) => m === k) || [])[2] || "";
+
+function scriptBadge(script) {
+  const st = script?.status || "none";
+  if (st === "ready") return `<span class="script-badge ready" title="Recorded ${esc(relTime(script.recorded_at))}; replays without AI">script</span>`;
+  if (st === "outdated") return `<span class="script-badge outdated" title="The test changed after its script was recorded; the next Auto run re-records it">script outdated</span>`;
+  return `<span class="script-badge none" title="No script yet; the next Auto or AI run records one">no script</span>`;
+}
+
+async function showScript(project, suite, testId) {
+  let code;
+  try {
+    code = await api(`/projects/${encodeURIComponent(project)}/suites/${encodeURIComponent(suite)}/scripts/${encodeURIComponent(testId)}`);
+  } catch (ex) {
+    toast(ex.message, true);
+    return;
+  }
+  const dialog = document.createElement("dialog");
+  dialog.className = "dialog code-dialog";
+  dialog.innerHTML = `<form method="dialog">
+    <h2>Script for ${esc(testId)}</h2>
+    <p class="muted small">Recorded from an AI run and replayed with plain Playwright. <code>v('…')</code> reads project values; <code>url('…')</code> is relative to the run's URL.</p>
+    <pre class="plan-src">${esc(code)}</pre>
+    <div class="dialog-actions">
+      <button class="btn btn-danger" value="forget" type="submit">Forget script</button>
+      <span class="spacer"></span>
+      <button class="btn btn-primary" value="close">Close</button>
+    </div></form>`;
+  document.body.append(dialog);
+  dialog.addEventListener("close", async () => {
+    if (dialog.returnValue === "forget" && confirm(`Forget the script for ${testId}? The next Auto or AI run records a new one.`)) {
+      await api(`/projects/${encodeURIComponent(project)}/suites/${encodeURIComponent(suite)}/scripts/${encodeURIComponent(testId)}`, { method: "DELETE" })
+        .then(() => { toast("Script forgotten"); route(); }).catch((ex) => toast(ex.message, true));
+    }
+    dialog.remove();
+  });
+  dialog.showModal();
 }
 
 // ── Test case editor ─────────────────────────────────────────────────
@@ -419,7 +517,7 @@ function unknownPlaceholders(text, known) {
  *          onChange() (after any edit)
  * Returns { cases() } giving the current state.
  */
-function caseEditor(container, initial, { single = false, project = null, placeholders = [], onFocus = () => {}, onChange = () => {} } = {}) {
+function caseEditor(container, initial, { single = false, project = null, placeholders = [], onFocus = () => {}, onChange = () => {}, badge = () => "" } = {}) {
   let cases = initial.length ? initial.map((c) => ({ ...emptyCase(), ...c })) : [emptyCase()];
   const known = new Set(placeholders);
   let drag = null;
@@ -432,35 +530,63 @@ function caseEditor(container, initial, { single = false, project = null, placeh
       <button type="button" class="tc-x" data-remove-item title="Remove">✕</button>
     </div>`;
 
-  const cardHtml = (c, ci) => `
-    <article class="tc-card" data-ci="${ci}">
+  // View-only state per case (collapsed, revealed optional sections), never sent to the server
+  const ui = new WeakMap();
+  const uiOf = (c) => { if (!ui.has(c)) ui.set(c, {}); return ui.get(c); };
+  const isBlank = (c) => !c.title.trim() && ![...c.preconditions, ...c.steps, ...c.expected].some((v) => v.trim());
+  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  const summary = (c) => `${plural(c.steps.filter((v) => v.trim()).length, "step")} · ${plural(c.expected.filter((v) => v.trim()).length, "check")}`;
+  const [PRE, STEPS, EXPECTED] = CASE_LISTS;
+
+  const listHtml = (list, c, ci) => `
+    <section class="tc-list" data-list="${list.key}">
+      <h4>${list.label}</h4>
+      <div class="tc-items">${c[list.key].map((v, j) => itemHtml(list, ci, j, v)).join("")}</div>
+      <button type="button" class="tc-add" data-add="${list.key}">+ ${list.add}</button>
+    </section>`;
+
+  const cardHtml = (c, ci) => {
+    const u = uiOf(c);
+    const showPre = c.preconditions.length > 0 || u.pre;
+    const showNotes = Boolean(c.notes) || u.notes;
+    const showDraft = u.draft || isBlank(c);
+    const collapsed = u.collapsed && !single;
+    return `
+    <article class="tc-card ${single ? "is-single" : ""} ${collapsed ? "is-collapsed" : ""}" data-ci="${ci}">
       <header class="tc-head">
-        ${single ? "" : `<span class="tc-grip tc-card-grip" draggable="true" title="Drag to reorder test cases">⋮⋮</span>`}
+        ${single ? "" : `<span class="tc-grip tc-card-grip" draggable="true" title="Drag to reorder test cases">⋮⋮</span>
+          <button type="button" class="tc-fold" data-fold aria-expanded="${!collapsed}" title="Collapse or expand">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg></button>`}
         <span class="case-id">${esc(c.id || "new")}</span>
         <input class="tc-title" value="${esc(c.title)}" placeholder="What does this test check?" aria-label="Test title">
-        <select class="tc-priority" aria-label="Priority"><option value="">Priority</option>
+        <span class="tc-summary" data-fold>${summary(c)}</span>
+        ${c.id ? badge(c.id) : ""}
+        <select class="tc-priority prio-${esc(c.priority || "none")}" aria-label="Priority"><option value="">priority</option>
           ${PRIORITIES.map((p) => `<option ${c.priority === p ? "selected" : ""}>${p}</option>`).join("")}</select>
-        <select class="tc-category" aria-label="Category"><option value="">Category</option>
+        <select class="tc-category" aria-label="Category"><option value="">category</option>
           ${CATEGORIES.map((p) => `<option ${c.category === p ? "selected" : ""}>${p}</option>`).join("")}</select>
         ${single ? "" : `<button type="button" class="tc-x" data-remove-case title="Remove test case">✕</button>`}
       </header>
-      <div class="tc-draft">
-        <input class="tc-draft-input" placeholder="Describe the test in a sentence and let AI draft the steps, e.g. “Retailer creates a 10% promotion and sees it listed as active”">
-        <button type="button" class="btn btn-small" data-draft>Draft steps</button>
+      <div class="tc-body">
+        ${showDraft ? `<div class="tc-draft">
+          <input class="tc-draft-input" placeholder="Describe the test in a sentence and let AI draft it, e.g. “Retailer creates a 10% promotion and sees it listed as active”">
+          <button type="button" class="btn btn-small" data-draft>Draft steps</button>
+        </div>` : ""}
+        ${showPre ? listHtml(PRE, c, ci) : ""}
+        <div class="tc-columns">${listHtml(STEPS, c, ci)}${listHtml(EXPECTED, c, ci)}</div>
+        ${showNotes ? `<section class="tc-notes"><h4>Notes</h4>
+          <textarea class="tc-notes-input" rows="2" placeholder="Anything else the tester should know">${esc(c.notes)}</textarea></section>` : ""}
+        ${showPre && showNotes && showDraft ? "" : `<div class="tc-more">
+          ${showPre ? "" : `<button type="button" class="tc-add" data-reveal="pre">+ Precondition</button>`}
+          ${showNotes ? "" : `<button type="button" class="tc-add" data-reveal="notes">+ Notes</button>`}
+          ${showDraft ? "" : `<button type="button" class="tc-add" data-reveal="draft">Redraft with AI</button>`}
+        </div>`}
       </div>
-      ${CASE_LISTS.map((list) => `
-        <section class="tc-list" data-list="${list.key}">
-          <h4>${list.label}</h4>
-          <div class="tc-items">${c[list.key].map((v, j) => itemHtml(list, ci, j, v)).join("")}</div>
-          <button type="button" class="tc-add" data-add="${list.key}">+ ${list.add}</button>
-        </section>`).join("")}
-      <details class="tc-notes" ${c.notes ? "open" : ""}>
-        <summary>Notes</summary>
-        <textarea class="tc-notes-input" rows="2" placeholder="Anything else the tester should know">${esc(c.notes)}</textarea>
-      </details>
     </article>`;
+  };
 
-  const draw = (focus) => {
+  // quiet: a view-only redraw (folding, revealing a section) that doesn't count as an edit
+  const draw = (focus, quiet = false) => {
     container.innerHTML = cases.map(cardHtml).join("")
       + (single ? "" : `<button type="button" class="btn btn-small tc-add-case" data-add-case>+ Add test case</button>`);
     container.querySelectorAll(".tc-input, .tc-title, .tc-notes-input").forEach(checkPlaceholders);
@@ -468,7 +594,7 @@ function caseEditor(container, initial, { single = false, project = null, placeh
       const el = container.querySelector(focus);
       if (el) { el.focus(); el.setSelectionRange?.(el.value.length, el.value.length); }
     }
-    onChange();
+    if (!quiet) onChange();
   };
 
   const checkPlaceholders = (el) => {
@@ -501,7 +627,10 @@ function caseEditor(container, initial, { single = false, project = null, placeh
   });
   container.addEventListener("change", (e) => {
     const { ci } = where(e.target);
-    if (e.target.classList.contains("tc-priority")) cases[ci].priority = e.target.value;
+    if (e.target.classList.contains("tc-priority")) {
+      cases[ci].priority = e.target.value;
+      e.target.className = `tc-priority prio-${e.target.value || "none"}`;
+    }
     if (e.target.classList.contains("tc-category")) cases[ci].category = e.target.value;
   });
   container.addEventListener("focusin", (e) => {
@@ -545,7 +674,21 @@ function caseEditor(container, initial, { single = false, project = null, placeh
   container.addEventListener("click", async (e) => {
     const t = e.target;
     const { ci, list, j } = where(t);
-    if (t.closest("[data-add]")) {
+    if (t.closest("[data-fold]")) {
+      const u = uiOf(cases[ci]);
+      u.collapsed = !u.collapsed;
+      const card = t.closest(".tc-card");
+      card.classList.toggle("is-collapsed", u.collapsed);
+      card.querySelector(".tc-fold").setAttribute("aria-expanded", String(!u.collapsed));
+      card.querySelector(".tc-summary").textContent = summary(cases[ci]);
+    } else if (t.closest("[data-reveal]")) {
+      const key = t.closest("[data-reveal]").dataset.reveal;
+      uiOf(cases[ci])[key] = true;
+      if (key === "pre" && !cases[ci].preconditions.length) cases[ci].preconditions.push("");
+      const card = `.tc-card[data-ci="${ci}"]`;
+      draw(key === "pre" ? itemSelector(ci, "preconditions", cases[ci].preconditions.length - 1)
+        : key === "notes" ? `${card} .tc-notes-input` : `${card} .tc-draft-input`, true);
+    } else if (t.closest("[data-add]")) {
       const key = t.closest("[data-add]").dataset.add;
       cases[ci][key].push("");
       draw(itemSelector(ci, key, cases[ci][key].length - 1));
@@ -632,6 +775,16 @@ function caseEditor(container, initial, { single = false, project = null, placeh
 
   draw();
   return {
+    setCollapsed: (collapsed) => { cases.forEach((c) => { uiOf(c).collapsed = collapsed; }); draw(null, true); },
+    reveal: (ci) => {
+      const card = container.querySelector(`.tc-card[data-ci="${ci}"]`);
+      if (!card) return;
+      if (uiOf(cases[ci]).collapsed) card.querySelector(".tc-fold")?.click();
+      card.scrollIntoView({ behavior: "smooth", block: "start" });
+      card.classList.remove("flash");
+      void card.offsetWidth;
+      card.classList.add("flash");
+    },
     replace: (next) => { cases = next.length ? next.map((c) => ({ ...emptyCase(), ...c })) : [emptyCase()]; draw(); },
     cases: () => cases.map((c) => ({ ...c, preconditions: c.preconditions.filter((v) => v.trim()),
       steps: c.steps.filter((v) => v.trim()), expected: c.expected.filter((v) => v.trim()) })),
@@ -693,16 +846,19 @@ async function newRunView(params, alive) {
         <span>What to test</span>
         <div class="segmented" role="group" aria-label="Input type">
           <button type="button" data-mode="quick" aria-pressed="true">Quick test</button>
-          <button type="button" data-mode="suite" aria-pressed="false" id="suite-mode-btn" hidden>Suite</button>
+          <button type="button" data-mode="suite" aria-pressed="false" id="suite-mode-btn">Saved suite</button>
         </div>
         <span class="hint" id="mode-hint">One test, run now. It isn't saved, apart from the run's results.</span>
       </div>
 
       <div id="mode-quick" class="tc-editor"></div>
 
+      <div id="mode-suite-empty" class="notice" hidden></div>
       <div id="mode-suite" class="form" style="gap:14px" hidden>
         <label class="field"><span>Suite</span><select name="suite"></select>
           <span class="hint" id="suite-hint"></span></label>
+        <label class="field"><span>How to run</span>${modeSelect("run_mode")}
+          <span class="hint" id="run-mode-hint">${esc(modeDescription("auto"))}</span></label>
         <fieldset class="suite-picks">
           <legend class="small">Tests to run</legend>
           <label class="select-all"><input type="checkbox" id="suite-all" checked> All</label>
@@ -751,12 +907,23 @@ async function newRunView(params, alive) {
   const setMode = (next) => {
     mode = next;
     view.querySelectorAll("[data-mode]").forEach((x) => x.setAttribute("aria-pressed", String(x.dataset.mode === mode)));
+    const noSuites = !suites.length;
     view.querySelector("#mode-quick").hidden = mode !== "quick";
-    view.querySelector("#mode-suite").hidden = mode !== "suite";
+    view.querySelector("#mode-suite").hidden = mode !== "suite" || noSuites;
     view.querySelector("#placeholders").classList.toggle("off", mode === "suite");
     view.querySelector("#mode-hint").textContent = mode === "quick"
-      ? "One test, run now. It isn't saved, apart from the run's results."
-      : "A saved set of tests from this project.";
+      ? "Write one test below and run it now. It isn't saved, apart from the run's results."
+      : "Run some or all of a project's saved tests.";
+    // Explain why there's nothing to pick, and what to do about it
+    const empty = view.querySelector("#mode-suite-empty");
+    const slug = form.elements.project.value;
+    empty.hidden = mode !== "suite" || !noSuites;
+    empty.innerHTML = !slug
+      ? "Saved suites belong to a project. Pick a project above to run one of its suites."
+      : `<b>${esc(byName[slug]?.name || slug)}</b> has no saved suites yet. `
+        + `<a href="#/projects/${esc(slug)}/discover">Discover tests</a> to have argus-qa propose some, or `
+        + `<a href="#/projects/${esc(slug)}/suites/new">write a suite</a>.`;
+    view.querySelector("#submit-btn").disabled = mode === "suite" && noSuites;
     lastFocused = null;
   };
   const drawSuite = () => {
@@ -767,7 +934,7 @@ async function newRunView(params, alive) {
       + `<a href="#/projects/${esc(form.elements.project.value)}/suites/${esc(suite.slug)}">Edit suite</a>`;
     view.querySelector("#suite-tests").innerHTML = suite.tests.map((t) => `
       <label class="suite-test"><input type="checkbox" value="${esc(t.id)}" checked>
-        <span class="case-id">${esc(t.id)}</span> ${esc(t.name)}</label>`).join("");
+        <span class="case-id">${esc(t.id)}</span> ${esc(t.name)} ${scriptBadge(t.script)}</label>`).join("");
     view.querySelector("#suite-all").checked = true;
     view.querySelector("#suite-all").indeterminate = false;
   };
@@ -775,18 +942,20 @@ async function newRunView(params, alive) {
     const slug = form.elements.project.value;
     suites = slug ? await api(`/projects/${encodeURIComponent(slug)}/suites`).catch(() => []) : [];
     if (!alive() || slug !== form.elements.project.value) return;
-    view.querySelector("#suite-mode-btn").hidden = !suites.length;
     form.elements.suite.innerHTML = suites.map((st) => `<option value="${esc(st.slug)}">${esc(st.name)} (${st.test_count} test${st.test_count === 1 ? "" : "s"})</option>`).join("");
     const preferred = params.get("suite");
     if (preferred && suites.some((st) => st.slug === preferred)) {
       form.elements.suite.value = preferred;
       setMode("suite");
-    } else if (mode === "suite" && !suites.length) {
-      setMode("quick");
+    } else {
+      setMode(mode);
     }
     drawSuite();
   };
   form.elements.suite.addEventListener("change", drawSuite);
+  form.elements.run_mode.addEventListener("change", (e) => {
+    view.querySelector("#run-mode-hint").textContent = modeDescription(e.target.value);
+  });
   view.querySelector("#suite-all").addEventListener("change", (e) => {
     view.querySelectorAll("#suite-tests input").forEach((b) => { b.checked = e.target.checked; });
   });
@@ -833,6 +1002,7 @@ async function newRunView(params, alive) {
         return;
       }
       if (picked.length < boxes.length) body.only = picked;
+      body.mode = f.run_mode.value;
     } else {
       const [test] = quick.cases();
       if (!test.steps.length) {
@@ -882,10 +1052,13 @@ async function runView(runId, alive) {
   let tab = run.kind === "explore" ? "bugs" : run.kind === "discover" ? "proposed" : "tests";
   let reportHtml = null;
   let planText = null;
+  let planCases = null;   // test ID -> the test's fields as the run had them, for showing proposed updates
   let feedCursor = 0;
   let actionCount = 0;
   let lastAgent = "";
   let lastSignature = "";
+  let lastTime = 0;       // when the feed last showed a timestamp
+  let quietLine = null;   // the latest line of look-only actions, which the next ones join
   const caseNames = {};
   const agentCase = {};     // agent -> test case it's working on now
   const agentAction = {};   // agent -> its latest browser action
@@ -915,6 +1088,17 @@ async function runView(runId, alive) {
 
   const $ = (sel) => view.querySelector(sel);
 
+  // The run's failures, split into the tests it stopped before and the ones that really failed
+  const failures = () => {
+    const unreached = (results?.results || []).filter((r) => r.cause === "not_reached").map((r) => r.id);
+    return { unreached, failed: run.failed_ids.filter((id) => !unreached.includes(id)) };
+  };
+
+  const rerun = async (body) => {
+    const fresh = await api(`/runs/${runId}/rerun`, { method: "POST", body });
+    location.hash = `#/runs/${fresh.id}`;
+  };
+
   const drawHeader = () => {
     document.body.classList.toggle("live", ACTIVE.has(run.status));
     const onlyCase = results?.results?.length === 1 ? results.results[0].name : "";
@@ -924,6 +1108,7 @@ async function runView(runId, alive) {
     document.title = `${mark} ${run.status === "running" ? "Running" : run.status[0].toUpperCase() + run.status.slice(1)} · ${title} — argus-qa`.trim();
     $("#run-meta").innerHTML = [
       session ? `<span class="kind ${esc(run.kind)}">${run.kind === "discover" ? "Discover" : "Explore"}</span>` : "",
+      run.suite ? `<span class="kind mode-${esc(run.mode)}" title="${esc(modeDescription(run.mode))}">${esc(MODE_LABEL[run.mode] || run.mode)}</span>` : "",
       statusBadge(run.status),
       run.project ? `<a href="#/projects/${esc(run.project)}">${esc(run.project)}</a>` : "",
       `<a class="mono" href="${esc(run.url)}" target="_blank" rel="noopener">${esc(run.url)}</a>`,
@@ -937,26 +1122,44 @@ async function runView(runId, alive) {
     const actions = [];
     if (ACTIVE.has(run.status)) actions.push(`<button class="btn btn-danger" data-act="cancel">Cancel run</button>`);
     if (!ACTIVE.has(run.status) && !session) {
-      if (run.failed_ids.length) actions.push(`<button class="btn btn-primary" data-act="rerun-failed">Re-run ${run.failed_ids.length} failed</button>`);
+      // The most useful next step comes first and is the highlighted one
+      const { unreached, failed } = failures();
+      const next = [];
+      if (unreached.length) next.push(["continue", `Continue with ${unreached.length} not reached`, "Run the tests this run stopped before"]);
+      if (failed.length && run.suite && run.mode === "script") {
+        next.push(["ai-look", `Let the AI look at ${failed.length} failed`, "Run the failed tests again in Auto: the AI works out whether the app or the test is wrong, and re-records the script"]);
+      }
+      if (failed.length) next.push(["rerun-failed", `Re-run ${failed.length} failed`, ""]);
+      next.forEach(([act, label, title], n) => actions.push(
+        `<button class="btn ${n ? "" : "btn-primary"}" data-act="${act}" title="${esc(title)}">${label}</button>`));
       actions.push(`<button class="btn" data-act="rerun-all">Re-run all</button>`);
     }
     if (!ACTIVE.has(run.status)) {
       actions.push(`<button class="btn btn-ghost btn-small btn-danger" data-act="delete">Delete</button>`);
     }
-    if (results && !session) {
+    if (results && !results.partial && !session) {
       actions.push(`<button class="btn btn-ghost btn-small" data-act="dl-junit">junit.xml</button>`);
       actions.push(`<button class="btn btn-ghost btn-small" data-act="dl-results">results.json</button>`);
     }
     $("#run-actions").innerHTML = actions.join("");
 
-    $("#run-banner").innerHTML = run.error
+    const how = (run.summary?.by_script !== undefined
+      ? `<div class="how-run"><b>${run.summary.by_script}</b> by script · <b>${run.summary.by_ai}</b> by AI${run.summary.healed ? ` · <b class="healed">${run.summary.healed} healed</b> (the page changed; scripts re-recorded)` : ""}${run.summary.flaky ? ` · <b class="flaky">${run.summary.flaky} flaky</b> (passed on a retry)` : ""}</div>` : "")
+      + (run.summary?.causes ? `<div class="how-run why">Why tests failed: ${Object.entries(run.summary.causes)
+        .map(([k, n]) => `<span class="cause cause-${esc(k)}">${n} ${esc(causeLabel(k, n))}</span>`).join(" · ")}</div>` : "");
+    $("#run-banner").innerHTML = (run.error
       ? `<div class="banner">${esc(run.error)}</div>`
-      : run.status === "queued" ? `<div class="banner info">Waiting for a free browser slot…</div>` : "";
+      : run.status === "queued" ? `<div class="banner info">Waiting for a free browser slot…</div>` : "") + how;
 
     const s = run.summary || { passed: 0, failed: 0, blocked: 0, skipped: 0 };
     const score = (cls, n, label) => `<div class="score ${cls} ${n ? "" : "zero"}"><b>${n}</b><span>${label}</span></div>`;
     const saved = run.accepted?.length || 0;
-    $("#scoreboard").innerHTML = session && run.summary
+    const sofar = !run.summary && results?.partial && results.results.length ? results.summary : null;
+    $("#scoreboard").innerHTML = sofar
+      // Still running: what has finished so far
+      ? score("p", sofar.passed, "Passed") + score("f", sofar.failed + sofar.blocked, "Failed")
+        + score("", run.test_ids.length - results.results.length, "To go") + score("", duration(run) || "—", "Elapsed")
+      : session && run.summary
       ? (run.kind === "discover"
         ? score("", run.summary.proposed || 0, "Tests proposed") + score("", run.summary.pages || 0, "Pages mapped")
           + score("", run.summary.flows || 0, "User flows") + score("p", saved, "Saved to suites")
@@ -979,9 +1182,12 @@ async function runView(runId, alive) {
         run = await api(`/runs/${runId}/cancel`, { method: "POST" });
         toast("Cancelling…");
         drawHeader();
-      } else if (act === "rerun-failed" || act === "rerun-all") {
-        const fresh = await api(`/runs/${runId}/rerun`, { method: "POST", body: { failed_only: act === "rerun-failed" } });
-        location.hash = `#/runs/${fresh.id}`;
+      } else if (act === "rerun-all") {
+        await rerun({ failed_only: false });
+      } else if (act === "rerun-failed" || act === "ai-look" || act === "continue") {
+        const { unreached, failed } = failures();
+        const which = act === "continue" ? { only: unreached } : unreached.length ? { only: failed } : { failed_only: true };
+        await rerun({ ...which, ...(act === "ai-look" ? { mode: "auto" } : {}) });
       } else if (act === "delete") {
         const extra = session && run.accepted?.length ? " Tests already saved to suites are kept." : "";
         if (!confirm(`Delete this run and its screenshots, report, and activity log?${extra}`)) return;
@@ -1026,21 +1232,22 @@ async function runView(runId, alive) {
   const thumb = (name, caption) =>
     `<button type="button" class="thumb" aria-label="Open ${esc(caption || name)}"><img data-shot="${esc(name)}" alt="${esc(caption || name)}"></button>`;
 
+  // A test that has no result yet: waiting, or being worked on right now
+  const waitingCase = (id) => {
+    const live = ACTIVE.has(run.status);
+    const agent = Object.keys(agentCase).find((a) => agentCase[a] === id);
+    const state = !live ? run.status : agent ? "running" : seenCases.has(id) ? "done" : "queued";
+    const now = agent && agentAction[agent]
+      ? `<p class="case-now"><span>Now</span>${esc(agentAction[agent])}</p>` : "";
+    return `<article class="case ${agent ? "is-current" : ""}"><div class="case-head"><span class="case-id">${esc(id)}</span>
+      <span class="case-name ${caseNames[id] ? "" : "muted"}">${esc(caseNames[id] || (live ? "Waiting for results…" : "No results recorded"))}</span>
+      ${statusBadge(state === "done" ? "checked" : state)}</div>${now}</article>`;
+  };
+
   const drawTests = () => {
-    if (!results) {
-      const live = ACTIVE.has(run.status);
-      const current = Object.fromEntries(Object.entries(agentCase).map(([agent, id]) => [id, agent]));
-      return `<div>${run.test_ids.map((id) => {
-        const agent = current[id];
-        const state = !live ? run.status : agent ? "running" : seenCases.has(id) ? "done" : "queued";
-        const now = agent && agentAction[agent]
-          ? `<p class="case-now"><span>Now</span>${esc(agentAction[agent])}</p>` : "";
-        return `<article class="case ${agent ? "is-current" : ""}"><div class="case-head"><span class="case-id">${esc(id)}</span>
-          <span class="case-name ${caseNames[id] ? "" : "muted"}">${esc(caseNames[id] || (live ? "Waiting for results…" : "No results recorded"))}</span>
-          ${statusBadge(state === "done" ? "checked" : state)}</div>${now}</article>`;
-      }).join("")}
-      ${live ? `<p class="muted small live-note">Step-by-step results, expected vs actual, appear here when the run finishes.</p>` : ""}</div>`;
-    }
+    const live = ACTIVE.has(run.status);
+    const liveNote = live ? `<p class="muted small live-note">Each test's result, step by step, appears here as soon as the agent finishes that test.</p>` : "";
+    if (!results) return `<div>${run.test_ids.map(waitingCase).join("")}${liveNote}</div>`;
     const images = new Set(shots.filter(isImage));
     const bugs = (results.bugs || []).map((b) => `
       <div class="bug">
@@ -1049,10 +1256,14 @@ async function runView(runId, alive) {
         ${b.expected ? `<p><b>Expected:</b> ${esc(b.expected)}</p>` : ""}
         ${b.actual ? `<p><b>Actual:</b> ${esc(b.actual)}</p>` : ""}
       </div>`).join("");
-    const cases = results.results.map((r) => `
+    const finishedCase = (r) => `
       <article class="case">
-        <div class="case-head"><span class="case-id">${esc(r.id)}</span><span class="case-name">${esc(r.name || "")}</span>${statusBadge(r.status)}</div>
+        <div class="case-head"><span class="case-id">${esc(r.id)}</span><span class="case-name">${esc(r.name || "")}</span>${ranBy(r)}${r.cause ? `<span class="cause cause-${esc(r.cause)}" title="${esc(CAUSES[r.cause]?.[1] || "")}">${esc(CAUSES[r.cause]?.[0] || r.cause)}</span>` : ""}${statusBadge(r.status)}</div>
+        ${r.script ? `<p class="script-note ${r.script === "recorded" ? "ok" : ""}">${r.script === "recorded" ? "✓ Script recorded: next time this test replays without AI" : esc(r.script.replace(/^not recorded: /, "No script recorded: "))}</p>` : ""}
         ${r.notes ? `<p class="case-notes" title="Click to expand">${esc(r.notes)}</p>` : ""}
+        ${evidence(r.evidence)}
+        ${proposedUpdate(r)}
+        ${nextSteps(r)}
         ${(r.steps || []).length ? `<ol class="steps">${r.steps.map((st) => `
           <li class="step ${esc(st.status || "")}">
             <div class="step-text">${esc(st.step)}</div>
@@ -1062,8 +1273,132 @@ async function runView(runId, alive) {
               ${st.actual ? `<dt>Actual</dt><dd class="actual">${esc(st.actual)}</dd>` : ""}
             </dl>
           </li>`).join("")}</ol>` : ""}
-      </article>`).join("");
+      </article>`;
+    // While the run is going, the tests without a result yet keep their place in the list
+    const byId = new Map(results.results.map((r) => [r.id, r]));
+    const cases = results.partial
+      ? run.test_ids.map((id) => (byId.has(id) ? finishedCase(byId.get(id)) : waitingCase(id))).join("") + liveNote
+      : results.results.map(finishedCase).join("");
     return (bugs ? `<section class="bugs"><h2 class="section-label">Bugs found</h2>${bugs}</section>` : "") + cases;
+  };
+
+  // What to do about a failed test, by its cause
+  const nextSteps = (r) => {
+    if (!r.cause || ACTIVE.has(run.status)) return "";
+    const button = (act, label, title) =>
+      `<button type="button" class="btn btn-small" data-case-act="${act}" data-id="${esc(r.id)}" title="${esc(title)}">${label}</button>`;
+    const suiteHref = `#/projects/${esc(run.project)}/suites/${esc(run.suite)}`;
+    const acts = [];
+    if (r.cause === "bug") {
+      acts.push(button("copy-bug", "Copy bug report", "Steps, expected and actual, and the evidence, ready to paste into a ticket"));
+    } else if (r.cause === "not_reached") {
+      acts.push(button("run-one", "Run this test", "Run just this test now"));
+    } else if (r.mode === "script" && run.suite) {
+      // A script can only say that it failed (or that there is none)
+      acts.push(button("ai-look", r.status === "blocked" ? "Run it with AI" : "Let the AI look",
+        "Run this test again in Auto: the AI works out whether the app or the test is wrong, and records a script"));
+    } else if (r.cause === "outdated" && !r.update && run.suite) {
+      acts.push(`<a class="btn btn-small" href="${suiteHref}">Edit the test in its suite</a>`);
+    } else if (r.cause === "environment" && run.project) {
+      acts.push(`<a class="btn btn-small" href="#/projects/${esc(run.project)}">Check the project's URL and accounts</a>`);
+    } else if (r.cause === "unknown" && r.status === "blocked") {
+      acts.push(button("run-one", "Run this test", "The agent gave no result for this test: run just this one again"));
+    }
+    return acts.length ? `<div class="case-actions">${acts.join("")}</div>` : "";
+  };
+
+  // The tester's corrected wording for a test, next to what the test says now
+  const proposedUpdate = (r) => {
+    if (!r.update) return "";
+    const before = planCases?.[r.id] || {};
+    const part = (key, title) => (r.update[key] ? `<h4>${title}</h4><ul class="diff">${
+      diffLines(before[key] || [], r.update[key]).map(([kind, text]) =>
+        `<li class="${kind}">${kind === "del" ? `<del>${esc(text)}</del>` : kind === "add" ? `<ins>${esc(text)}</ins>` : esc(text)}</li>`).join("")}</ul>` : "");
+    const button = (act, label, cls = "") =>
+      `<button type="button" class="btn btn-small ${cls}" data-case-act="${act}" data-id="${esc(r.id)}">${label}</button>`;
+    const suiteLink = `<a href="#/projects/${esc(run.project)}/suites/${esc(run.suite)}">Edit it by hand</a>`;
+    let foot;
+    if ((run.updated || []).includes(r.id)) {
+      foot = `<span class="applied">✓ Applied to the suite</span>${button("run-updated", "Run the updated test")}`;
+    } else if (JSON.stringify(r.update).includes("[redacted]")) {
+      foot = `<span class="muted small">The tester wrote out a secret value here, which was removed. ${run.suite ? suiteLink : "Edit the test by hand"} and use a placeholder for it.</span>`;
+    } else if (run.suite && !ACTIVE.has(run.status)) {
+      foot = `${button("apply-update", "Apply to suite", "btn-primary")}<span class="muted small">Keeps the test's ID. ${suiteLink}</span>`;
+    } else {
+      foot = `${button("copy-update", "Copy the new wording")}${run.suite ? "" : `<span class="muted small">This run didn't come from a saved suite, so there is no suite to update.</span>`}`;
+    }
+    return `<div class="update">
+      <p class="update-head">${r.status === "passed" ? "This test passed, but its wording no longer matches the app." : "The app changed."} The tester proposes this update to the test:</p>
+      ${part("steps", "Steps")}${part("expected", "Acceptance criteria")}
+      <div class="case-actions">${foot}</div></div>`;
+  };
+
+  const bugReport = (r) => {
+    const bug = (results.bugs || []).find((b) => b.test_case === r.id) || {};
+    const failed = (r.steps || []).find((st) => st.status === "failed") || {};
+    const steps = bug.steps_to_reproduce?.length ? bug.steps_to_reproduce : (r.steps || []).map((st) => st.step);
+    const expected = bug.expected || failed.expected;
+    const actual = bug.actual || failed.actual;
+    const lines = [`# ${bug.title || r.name || r.id}`, "", `Found by the test ${r.id}${r.name ? `: ${r.name}` : ""}, on ${run.url}`, ""];
+    if (bug.severity) lines.push(`**Severity:** ${bug.severity}`, "");
+    if (steps.length) lines.push("**Steps to reproduce:**", ...steps.map((st, n) => `${n + 1}. ${st}`), "");
+    if (expected) lines.push(`**Expected:** ${expected}`, "");
+    if (actual) lines.push(`**Actual:** ${actual}`, "");
+    if (r.notes) lines.push(r.notes, "");
+    for (const [kind, title] of [["console", "Console errors"], ["network", "Failed requests"]]) {
+      if (r.evidence?.[kind]?.length) lines.push(`**${title}:**`, ...r.evidence[kind].map((line) => `- \`${line}\``), "");
+    }
+    lines.push(`Run: ${location.origin}${location.pathname}#/runs/${runId}`);
+    return lines.join("\n");
+  };
+
+  const updateText = (r) => [
+    ...(r.update.steps ? ["Steps:", ...r.update.steps.map((st, n) => `${n + 1}. ${st}`), ""] : []),
+    ...(r.update.expected ? ["Acceptance criteria:", ...r.update.expected.map((line) => `- ${line}`)] : []),
+  ].join("\n").trim();
+
+  $("#tab-body").addEventListener("click", async (e) => {
+    const btn = e.target.closest("[data-case-act]");
+    const r = btn && results?.results?.find((x) => x.id === btn.dataset.id);
+    if (!r) return;
+    const act = btn.dataset.caseAct;
+    try {
+      if (act === "copy-bug") {
+        await copyText(bugReport(r), "Bug report copied");
+      } else if (act === "copy-update") {
+        await copyText(updateText(r), "New wording copied");
+      } else if (act === "apply-update") {
+        btn.disabled = true;
+        const suite = await api(`/runs/${runId}/tests/${encodeURIComponent(r.id)}/update`, { method: "POST" });
+        toast(`${r.id} updated in “${suite.name}”`);
+        run = await api(`/runs/${runId}`);
+        lastSignature = "";
+        await refresh();
+      } else {
+        btn.disabled = true;
+        // An updated test's script is outdated, and only the AI can say why a script failed
+        const auto = act === "ai-look" || (act === "run-updated" && run.mode === "script");
+        await rerun({ only: [r.id], ...(auto ? { mode: "auto" } : {}) });
+      }
+    } catch (ex) {
+      toast(ex.message, true);
+      btn.disabled = false;
+    }
+  });
+
+  const evidence = (ev) => {
+    const rows = [["console", "Console errors"], ["network", "Failed requests"]].filter(([k]) => ev?.[k]?.length);
+    return rows.length ? `<dl class="evidence">${rows.map(([k, title]) =>
+      `<dt>${title}</dt>${ev[k].map((line) => `<dd><code>${esc(line)}</code></dd>`).join("")}`).join("")}</dl>` : "";
+  };
+
+  const ranBy = (r) => {
+    if (r.cause === "not_reached") return "";
+    if (r.flaky) return `<span class="ran-by flaky" title="Its script failed once, then passed on a retry">flaky</span>`;
+    if (r.healed) return `<span class="ran-by healed" title="Its script failed, the AI completed it: the page changed">healed by AI</span>`;
+    if (r.mode === "script") return `<span class="ran-by script">script${r.duration_ms ? ` · ${(r.duration_ms / 1000).toFixed(1)}s` : ""}</span>`;
+    if (r.mode === "ai") return `<span class="ran-by ai">AI</span>`;
+    return "";
   };
 
   const waiting = (what) => `<p class="muted">${ACTIVE.has(run.status)
@@ -1240,25 +1575,52 @@ async function runView(runId, alive) {
       ? `<span class="ev-agent" style="color:${agentColor(ev.agent)}">${esc(ev.agent)}</span>` : "";
     if (ev.kind === "phase") lastAgent = "";
     else if (ev.agent) lastAgent = ev.agent;
-    const time = `<time datetime="${esc(ev.ts)}">${esc(clock(ev.ts))}</time>`;
-    const tcMatch = (ev.file || ev.text || "").match(/TC-\d+/i);
+    // A timestamp when the speaker changes, the agent speaks, or 15s have passed
+    const at = Date.parse(ev.ts) || 0;
+    const stamp = who || ev.kind !== "action" || at - lastTime >= 15000;
+    if (stamp) lastTime = at;
+    const time = stamp ? `<time datetime="${esc(ev.ts)}">${esc(clock(ev.ts))}</time>` : "<span></span>";
+    const tcMatch = ev.kind !== "result" && (ev.file || ev.text || "").match(/TC-\d+/i);
     if (ev.agent && tcMatch) {
       const id = tcMatch[0].toUpperCase();
       if (agentCase[ev.agent] && agentCase[ev.agent] !== id) seenCases.add(agentCase[ev.agent]);
       agentCase[ev.agent] = id;
       seenCases.add(id);
     }
-    if (ev.kind === "phase") {
+    if (ev.kind === "result") {
+      // The agent handed in a test's result: it is no longer working on that test
+      seenCases.add(ev.test);
+      if (agentCase[ev.agent] === ev.test) delete agentCase[ev.agent];
+      el.innerHTML = `${time}<div class="ev-body">${who}<span class="case-id">${esc(ev.test)}</span> ${statusBadge(ev.status)}</div>`;
+    } else if (ev.kind === "phase") {
       el.innerHTML = esc(ev.text);
       lastAgent = "";
     } else if (ev.kind === "action") {
       actionCount += 1;
       if (ev.agent) agentAction[ev.agent] = ev.text;
       const [verb, ...rest] = ev.text.split(": ");
-      el.innerHTML = `${time}<div class="ev-body">${who}<span class="verb">${esc(verb)}</span>${rest.length ? ` ${esc(rest.join(": "))}` : ""}</div>`;
+      const detail = rest.join(": ");
+      if (ev.quiet) {
+        // Reading the page, logs or waiting: one dim line per burst, not one line each
+        const bit = `<span class="bit" title="${esc(ev.text)}">${esc(verb)}${ev.tool === "wait_for" && detail ? ` ${esc(detail)}` : ""}</span>`;
+        if (quietLine && !who && quietLine === feed.lastElementChild && quietLine.dataset.agent === ev.agent) {
+          quietLine.querySelector(".ev-body").insertAdjacentHTML("beforeend", bit);
+          return;
+        }
+        el.classList.add("quiet");
+        el.dataset.agent = ev.agent || "";
+        el.innerHTML = `${time}<div class="ev-body">${who}${bit}</div>`;
+        quietLine = el;
+      } else {
+        // Values typed or filled ("…" after ←) stand out from the element they went into
+        const shown = detail.split(/ ← ("(?:[^"]|"(?!, |$))*")/).map((part, n) => (n % 2
+          ? ` <span class="arrow">←</span> <span class="val">${esc(part)}</span>` : esc(part))).join("");
+        el.innerHTML = `${time}<div class="ev-body">${who}<span class="verb">${esc(verb)}</span>${detail ? ` ${shown}` : ""}</div>`;
+      }
       if (ev.file) {
-        el.querySelector(".ev-body").insertAdjacentHTML("beforeend", `<img class="ev-thumb" data-shot="${esc(ev.file)}" alt="${esc(ev.file)}">`);
-        setTimeout(() => hydrateImages(el, runId), 1500); // give the browser a moment to write the file
+        el.querySelector(".ev-body").insertAdjacentHTML("beforeend", `<img class="ev-thumb" data-shot="${esc(ev.file)}" alt="" aria-label="${esc(ev.file)}">`);
+        // During a live run, give the browser a moment to write the file
+        setTimeout(() => hydrateImages(el, runId), ACTIVE.has(run.status) ? 1500 : 0);
       }
     } else if (ev.kind === "say") {
       el.innerHTML = `${time}<div class="ev-body">${who}<div class="ev-text">${esc(ev.text)}</div></div>`;
@@ -1290,9 +1652,17 @@ async function runView(runId, alive) {
     run = await api(`/runs/${runId}`);
     if (!alive()) return;
     shots = await api(`/runs/${runId}/screenshots`).catch(() => shots);
-    // Results only exist once the run has finished
-    if (!ACTIVE.has(run.status) && (!results || wasActive) && run.kind !== "discover") {
+    // A test run saves each test's result as it finishes (results.partial until the run ends);
+    // an explore session's results only exist once it has finished
+    const stale = !results || results.partial || wasActive;
+    if (run.kind === "test" ? run.status === "running" || (!ACTIVE.has(run.status) && stale)
+      : run.kind === "explore" && !ACTIVE.has(run.status) && (!results || wasActive)) {
       results = await api(`/runs/${runId}/results`).catch(() => results);
+    }
+    if (planCases === null && planText && results?.results?.some((r) => r.update)) {
+      planCases = {};
+      const parsed = await api("/plans/parse", { method: "POST", body: { plan: planText } }).catch(() => null);
+      (parsed?.cases || []).forEach((tc) => { planCases[tc.id] = tc; });
     }
     if (!ACTIVE.has(run.status) && (!exploration || wasActive) && run.kind === "discover") {
       exploration = await api(`/runs/${runId}/exploration`).catch(() => exploration);
@@ -1304,7 +1674,7 @@ async function runView(runId, alive) {
     // Redraw the tab only when what it shows has changed, so thumbnails don't flicker
     // Live progress only affects the Tests tab; other tabs mustn't redraw on every action
     const live = ACTIVE.has(run.status) && tab === "tests" ? JSON.stringify([agentCase, agentAction]) : "";
-    const signature = `${tab}|${JSON.stringify(results)?.length}|${tab === "proposed" ? "" : shots.length}|${run.status}|${live}`;
+    const signature = `${tab}|${JSON.stringify(results)?.length}|${tab === "proposed" ? "" : shots.length}|${run.status}|${live}|${run.updated?.length}|${Object.keys(planCases || {}).length}`;
     if (signature !== lastSignature) {
       lastSignature = signature;
       await drawBody();
@@ -1386,10 +1756,11 @@ async function projectView(slug, params, alive) {
     return;
   }
 
-  const tab = params.get("tab") === "settings" ? "settings" : "suites";
-  const [project, suites, sessions] = await Promise.all([
+  const tab = ["settings", "schedules"].includes(params.get("tab")) ? params.get("tab") : "suites";
+  const [project, suites, schedules, sessions] = await Promise.all([
     api(`/projects/${encodeURIComponent(slug)}`),
     api(`/projects/${encodeURIComponent(slug)}/suites`),
+    api(`/projects/${encodeURIComponent(slug)}/schedules`),
     api(`/runs?project=${encodeURIComponent(slug)}&limit=200`),
   ]);
   if (!alive()) return;
@@ -1408,6 +1779,7 @@ async function projectView(slug, params, alive) {
     </div>
     <div class="tabs" role="tablist">
       <a role="tab" href="${base}" aria-selected="${tab === "suites"}">Test suites<span class="count">${suites.length || ""}</span></a>
+      <a role="tab" href="${base}?tab=schedules" aria-selected="${tab === "schedules"}">Schedules<span class="count">${schedules.length || ""}</span></a>
       <a role="tab" href="${base}?tab=settings" aria-selected="${tab === "settings"}">Settings</a>
     </div>
     <div id="project-body"></div>`;
@@ -1415,6 +1787,10 @@ async function projectView(slug, params, alive) {
   const body = view.querySelector("#project-body");
   if (tab === "settings") {
     projectSettingsForm(body, project, false);
+    return;
+  }
+  if (tab === "schedules") {
+    schedulesTab(body, project, suites, schedules, alive);
     return;
   }
 
@@ -1460,6 +1836,211 @@ async function projectView(slug, params, alive) {
       e.target.disabled = false;
     }
   });
+}
+
+// ── Schedules ────────────────────────────────────────────────────────
+
+const WEEKDAYS = [["mon", "Mon"], ["tue", "Tue"], ["wed", "Wed"], ["thu", "Thu"], ["fri", "Fri"], ["sat", "Sat"], ["sun", "Sun"]];
+
+function browserZone() {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"; } catch { return "UTC"; }
+}
+
+function cadence(s) {
+  const days = s.days.length === 0 || s.days.length === 7 ? "Every day"
+    : s.days.join() === "mon,tue,wed,thu,fri" ? "Weekdays"
+    : s.days.join() === "sat,sun" ? "Weekends"
+    : WEEKDAYS.filter(([d]) => s.days.includes(d)).map(([, label]) => label).join(", ");
+  return `${days} at ${s.time}`;
+}
+
+const dayTime = (iso) => new Date(iso).toLocaleString(undefined, { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+
+// The fields the API accepts back, from a schedule as the API returns it
+const scheduleBody = (s) => ({
+  name: s.name, suites: s.suites, days: s.days, time: s.time, timezone: s.timezone, mode: s.mode, parallel: s.parallel,
+  max_cost_usd: s.max_cost_usd, callback_url: s.callback_url, notify_on: s.notify_on, enabled: s.enabled,
+});
+
+function schedulesTab(body, project, suites, schedules, alive) {
+  const slug = project.slug;
+  const base = `#/projects/${encodeURIComponent(slug)}`;
+  const path = (s) => `/projects/${encodeURIComponent(slug)}/schedules/${encodeURIComponent(s.slug)}`;
+
+  if (!suites.length) {
+    body.innerHTML = `<div class="empty"><h2>No test suites to schedule</h2>
+      <p>A schedule runs saved suites, so this project needs one first.</p>
+      <a class="btn btn-primary" href="${base}">Go to test suites</a></div>`;
+    return;
+  }
+
+  const row = (s) => {
+    const failing = s.last_runs.some((r) => ["failed", "error"].includes(r.status));
+    return `<div class="schedule-row ${s.enabled ? "" : "is-paused"}" data-schedule="${esc(s.slug)}">
+      <div class="schedule-main">
+        <span class="name">${esc(s.name)}</span>
+        <span class="muted small">${esc(cadence(s))} · ${esc(s.timezone)} · ${esc(MODE_LABEL[s.mode])}</span>
+        <div class="chips">${s.suites.map((id) => s.suite_names[id]
+          ? `<a class="chip" href="${base}/suites/${esc(id)}">${esc(s.suite_names[id])}</a>`
+          : `<span class="chip static missing" title="This suite was deleted">${esc(id)} (deleted)</span>`).join("")}</div>
+        ${s.last_error ? `<p class="schedule-error">${esc(s.last_error)}</p>` : ""}
+      </div>
+      <div class="schedule-when small">
+        <div>${s.enabled ? `<span class="muted">Next</span> <span title="${esc(s.next_run_at)}">${esc(dayTime(s.next_run_at))}</span>` : '<span class="muted">Paused</span>'}</div>
+        <div>${s.last_runs.length
+          ? `<span class="muted">Last</span> ${s.last_runs.map((r) => `<a href="#/runs/${esc(r.id)}" title="${esc(r.title)}">${statusBadge(r.status)}</a>`).join(" ")}
+             <span class="muted">${esc(relTime(s.last_fired_at))}</span>`
+          : '<span class="muted">Never run</span>'}
+          ${s.last_fired_at ? ` · <a href="#/runs?project=${encodeURIComponent(slug)}&schedule=${encodeURIComponent(s.slug)}" class="${failing ? "text-fail" : ""}">History</a>` : ""}</div>
+      </div>
+      <div class="schedule-buttons">
+        <button class="btn btn-small" data-act="run">Run now</button>
+        <button class="btn btn-small" data-act="toggle">${s.enabled ? "Pause" : "Resume"}</button>
+        <button class="btn btn-small" data-act="edit">Edit</button>
+      </div>
+    </div>`;
+  };
+
+  body.innerHTML = schedules.length
+    ? `<p class="muted small schedule-intro">Each suite in a schedule gets its own run. Schedules fire while the server is running; a run that comes due while it's down for over an hour is skipped.</p>
+       <div class="schedules">${schedules.map(row).join("")}</div>
+       <div class="suite-actions"><button class="btn btn-small" id="new-schedule">New schedule</button></div>`
+    : `<div class="empty"><h2>No schedules yet</h2>
+        <p>Run this project's suites on their own, every night or at the end of the week. In Auto mode, recorded scripts replay without AI and the AI only steps in for tests that fail.</p>
+        <button class="btn btn-primary" id="new-schedule">New schedule</button></div>`;
+
+  body.querySelector("#new-schedule").addEventListener("click", () => scheduleDialog(project, suites, null));
+  body.addEventListener("click", async (e) => {
+    const act = e.target.closest("[data-act]")?.dataset.act;
+    if (!act) return;
+    const s = schedules.find((x) => x.slug === e.target.closest("[data-schedule]").dataset.schedule);
+    if (act === "edit") return scheduleDialog(project, suites, s);
+    e.target.disabled = true;
+    try {
+      if (act === "run") {
+        await api(`${path(s)}/run`, { method: "POST" });
+        location.hash = `#/runs?project=${encodeURIComponent(slug)}&schedule=${encodeURIComponent(s.slug)}`;
+      } else {
+        await api(path(s), { method: "PUT", body: { ...scheduleBody(s), enabled: !s.enabled } });
+        toast(s.enabled ? "Schedule paused" : "Schedule resumed");
+        if (alive()) route();
+      }
+    } catch (ex) {
+      toast(ex.message, true);
+      e.target.disabled = false;
+    }
+  });
+}
+
+function scheduleDialog(project, suites, schedule) {
+  const isNew = !schedule;
+  const s = schedule || {
+    name: "", suites: suites.map((x) => x.slug), days: [], time: "02:00", timezone: browserZone(), mode: "auto",
+    parallel: 1, max_cost_usd: null, callback_url: null, notify_on: "always", enabled: true,
+  };
+  const everyDay = s.days.length === 0;
+  let zones = [];
+  try { zones = Intl.supportedValuesOf("timeZone"); } catch { /* older browsers: free text */ }
+  const url = `/projects/${encodeURIComponent(project.slug)}/schedules`;
+
+  const dialog = document.createElement("dialog");
+  dialog.className = "dialog schedule-dialog";
+  dialog.innerHTML = `<form novalidate>
+    <h2>${isNew ? "New schedule" : `Edit ${esc(s.name)}`}</h2>
+    <label class="field"><span>Name</span><input name="name" required value="${esc(s.name)}" placeholder="Nightly"></label>
+    <fieldset class="suite-picks">
+      <legend class="small">Suites to run</legend>
+      ${suites.map((x) => `<label class="suite-test"><input type="checkbox" name="suite" value="${esc(x.slug)}" ${s.suites.includes(x.slug) ? "checked" : ""}>
+        ${esc(x.name)} <span class="muted small">${x.test_count} test${x.test_count === 1 ? "" : "s"} · ${x.scripts_ready} with a script</span></label>`).join("")}
+    </fieldset>
+    <div class="field"><span>Days</span>
+      <div class="day-picks">${WEEKDAYS.map(([d, label]) => `<label><input type="checkbox" name="day" value="${d}" ${everyDay || s.days.includes(d) ? "checked" : ""}><span>${label}</span></label>`).join("")}</div>
+    </div>
+    <div class="form-row schedule-time">
+      <label class="field"><span>Time</span><input type="time" name="time" required value="${esc(s.time)}"></label>
+      <label class="field"><span>Timezone</span><input name="timezone" required value="${esc(s.timezone)}" list="schedule-zones" autocomplete="off">
+        <datalist id="schedule-zones"><option value="UTC">${zones.map((z) => `<option value="${esc(z)}">`).join("")}</datalist></label>
+    </div>
+    <label class="field"><span>How to run</span>${modeSelect("mode", s.mode)}
+      <span class="hint" data-hint="mode"></span></label>
+    <label class="field"><span>Cost limit per suite (USD)</span>
+      <input type="number" name="max_cost_usd" min="0.1" max="100" step="0.1" value="${s.max_cost_usd ?? ""}" placeholder="${DEFAULTS.test}">
+      <span class="hint" data-hint="cost"></span></label>
+    <label class="field"><span>Webhook URL (optional)</span>
+      <input name="callback_url" type="url" value="${esc(s.callback_url || "")}" placeholder="https://hooks.example.com/argus">
+      <span class="hint">Each run's record is POSTed here when it finishes.</span></label>
+    <label class="suite-test"><input type="checkbox" name="failures_only" ${s.notify_on === "failure" ? "checked" : ""}> Only call the webhook for runs that don't pass</label>
+    <p class="form-error" hidden></p>
+    <div class="dialog-actions">
+      ${isNew ? "" : '<button class="btn btn-danger" type="button" data-delete>Delete</button>'}
+      <span class="spacer"></span>
+      <button class="btn" type="button" data-cancel>Cancel</button>
+      <button class="btn btn-primary" type="submit">${isNew ? "Create schedule" : "Save"}</button>
+    </div></form>`;
+  document.body.append(dialog);
+
+  const form = dialog.querySelector("form");
+  const f = form.elements;
+  const checked = (name) => [...form.querySelectorAll(`[name="${name}"]:checked`)].map((box) => box.value);
+  const hints = () => {
+    const count = checked("suite").length;
+    const limit = Number(f.max_cost_usd.value) || DEFAULTS.test;
+    form.querySelector('[data-hint="mode"]').textContent = modeDescription(f.mode.value);
+    form.querySelector('[data-hint="cost"]').textContent = f.mode.value === "script"
+      ? "Script-only runs don't use AI, so they cost nothing."
+      : `Each suite's run stops at this limit, so one firing can cost up to ${cost(limit * count)} (${count} suite${count === 1 ? "" : "s"} × ${cost(limit)}).`;
+  };
+  form.addEventListener("input", hints);
+  hints();
+
+  const close = () => { dialog.close(); dialog.remove(); };
+  dialog.addEventListener("cancel", () => dialog.remove());
+  form.querySelector("[data-cancel]").addEventListener("click", close);
+  form.querySelector("[data-delete]")?.addEventListener("click", async () => {
+    if (!confirm(`Delete the schedule “${s.name}”? Its past runs are kept.`)) return;
+    try {
+      await api(`${url}/${encodeURIComponent(s.slug)}`, { method: "DELETE" });
+      close();
+      toast("Schedule deleted");
+      route();
+    } catch (ex) {
+      toast(ex.message, true);
+    }
+  });
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const err = form.querySelector(".form-error");
+    const fail = (message) => { err.textContent = message; err.hidden = false; };
+    err.hidden = true;
+    const days = checked("day");
+    if (!f.name.value.trim()) return fail("Give the schedule a name.");
+    if (!checked("suite").length) return fail("Pick at least one suite.");
+    if (!days.length) return fail("Pick at least one day.");
+    const body = {
+      ...scheduleBody(s),
+      name: f.name.value.trim(),
+      suites: checked("suite"),
+      days: days.length === 7 ? [] : days,
+      time: f.time.value,
+      timezone: f.timezone.value.trim(),
+      mode: f.mode.value,
+      max_cost_usd: f.max_cost_usd.value ? Number(f.max_cost_usd.value) : null,
+      callback_url: f.callback_url.value.trim() || null,
+      notify_on: f.failures_only.checked ? "failure" : "always",
+    };
+    try {
+      await (isNew ? api(url, { method: "POST", body }) : api(`${url}/${encodeURIComponent(s.slug)}`, { method: "PUT", body }));
+      close();
+      toast(isNew ? "Schedule created" : "Saved");
+      route();
+    } catch (ex) {
+      fail(ex.message);
+    }
+  });
+
+  dialog.showModal();
+  if (isNew) f.name.focus();
 }
 
 function sessionOutcome(run) {
@@ -1626,17 +2207,20 @@ async function suiteView(slug, suiteSlug, alive) {
 
   view.innerHTML = `
     <a class="crumb" href="${base}">← ${esc(project.name)}</a>
-    <div class="page-head">
-      <div><h1>${isNew ? "New test suite" : esc(suite.name)}</h1>
-        <p class="sub">${isNew ? "A saved set of test cases you can run with one click." : `${suite.test_count} test${suite.test_count === 1 ? "" : "s"} · updated ${esc(relTime(suite.updated_at))}`}</p></div>
-      ${isNew ? "" : `<div class="page-head-actions">
-        <label class="inline-field">Parallel <input id="suite-parallel" type="number" min="1" max="8" value="1"></label>
+    <header class="suite-head">
+      <div class="suite-title">
+        <input class="title-input" name="name" form="suite-form" required value="${esc(suite?.name || "")}"
+          placeholder="${isNew ? "Name this suite, e.g. Smoke tests" : "Suite name"}" aria-label="Suite name">
+        <p class="sub">${isNew ? "A saved set of test cases you can run with one click." : `${suite.test_count} test${suite.test_count === 1 ? "" : "s"} · ${suite.scripts_ready} with a recorded script · updated ${esc(relTime(suite.updated_at))}`}</p>
+      </div>
+      ${isNew ? "" : `<div class="run-bar" role="group" aria-label="Run this suite">
+        <label class="run-opt" title="${esc(modeDescription("auto"))}"><span>Mode</span>${modeSelect("suite_mode")}</label>
+        <label class="run-opt"><span>Parallel</span><input id="suite-parallel" type="number" min="1" max="8" value="1"></label>
         <button class="btn btn-primary" id="run-suite">Run suite</button>
       </div>`}
-    </div>
-    <div class="run-grid ${runs.length ? "" : "no-feed"}">
-      <form class="form suite-form" id="suite-form" novalidate>
-        <label class="field"><span>Suite name</span><input name="name" required value="${esc(suite?.name || "")}" placeholder="Smoke tests"></label>
+    </header>
+    <div class="suite-layout">
+      <form class="suite-form" id="suite-form" novalidate>
         <div class="suite-toolbar">
           <div class="segmented" role="group" aria-label="Editing mode">
             <button type="button" data-edit-mode="fields" aria-pressed="true">Editor</button>
@@ -1644,11 +2228,10 @@ async function suiteView(slug, suiteSlug, alive) {
           </div>
           <span class="detected" id="detected"></span>
           <span class="spacer"></span>
+          <button type="button" class="btn btn-small btn-ghost" id="fold-all">Collapse all</button>
           <label class="btn btn-small" title="Add the test cases from a Markdown test plan (.md) file">
             Import Markdown…<input type="file" id="import-file" accept=".md,.markdown,.txt" hidden></label>
         </div>
-        ${placeholders.length ? `<div class="field values-bar"><span>Project values <span class="muted">— click to insert into the field you're editing</span></span>
-          <div class="chips" id="suite-chips"></div></div>` : ""}
         <div id="cases" class="tc-editor"></div>
         <textarea name="plan" rows="26" hidden aria-label="Suite as Markdown"></textarea>
         <details class="plan-notes" id="plan-notes" ${plan.notes ? "open" : ""}>
@@ -1659,14 +2242,26 @@ async function suiteView(slug, suiteSlug, alive) {
         <div class="form-actions sticky-actions">
           <button class="btn btn-primary" type="submit">${isNew ? "Create suite" : "Save changes"}</button>
           <a class="btn btn-ghost" href="${base}">Cancel</a>
+          <span class="dirty-note" id="dirty-note" hidden>Unsaved changes</span>
           <span class="spacer"></span>
           ${isNew ? "" : `<button class="btn btn-danger" type="button" id="delete-suite">Delete suite</button>`}
         </div>
       </form>
-      <aside class="side-list" aria-label="Recent runs">
-        <h2 class="section-label">Recent runs</h2>
-        ${runs.map((r) => `<a class="side-row" href="#/runs/${esc(r.id)}">${statusBadge(r.status)}
-          <span>${r.summary ? tally(r.summary) : ""}</span><span class="muted small">${esc(relTime(r.created_at))}</span></a>`).join("")}
+      <aside class="suite-aside">
+        <section class="aside-block" id="outline-block">
+          <h2 class="section-label">Tests</h2>
+          <nav class="outline" id="outline" aria-label="Jump to a test"></nav>
+        </section>
+        ${placeholders.length ? `<section class="aside-block">
+          <h2 class="section-label">Project values</h2>
+          <p class="muted small">Click to insert into the field you're editing.</p>
+          <div class="chips" id="suite-chips"></div>
+        </section>` : ""}
+        ${runs.length ? `<section class="aside-block">
+          <h2 class="section-label">Recent runs</h2>
+          ${runs.slice(0, 6).map((r) => `<a class="aside-run" href="#/runs/${esc(r.id)}">${statusBadge(r.status)}
+            <span class="aside-run-bar">${tallyBar(r.summary)}</span><span class="muted small">${esc(relTime(r.created_at))}</span></a>`).join("")}
+        </section>` : ""}
       </aside>
     </div>`;
 
@@ -1675,16 +2270,50 @@ async function suiteView(slug, suiteSlug, alive) {
   let mode = "fields";
   let editor = null;
   let lastField = null;
+  let allCollapsed = false;
+
+  const drawOutline = () => {
+    $("#outline-block").hidden = mode !== "fields";
+    if (mode !== "fields") return;
+    $("#outline").innerHTML = editor.cases().map((c, ci) => `
+      <button type="button" class="outline-item" data-jump="${ci}">
+        <span class="case-id">${esc(c.id || "new")}</span><span class="outline-title ${c.title.trim() ? "" : "muted"}">${esc(c.title.trim() || "Untitled")}</span>
+      </button>`).join("");
+    spy();
+  };
+  // Highlights the test at the top of the viewport in the outline
+  const spy = () => {
+    const cards = [...view.querySelectorAll(".tc-card")];
+    const current = cards.find((card) => card.getBoundingClientRect().bottom > 140) || cards[cards.length - 1];
+    view.querySelectorAll(".outline-item").forEach((b) => b.classList.toggle("active", current && b.dataset.jump === current.dataset.ci));
+  };
+  let spyQueued = false;
+  const onScroll = () => {
+    if (spyQueued) return;
+    spyQueued = true;
+    requestAnimationFrame(() => { spyQueued = false; spy(); });
+  };
+  window.addEventListener("scroll", onScroll, { passive: true });
+  onLeave(() => window.removeEventListener("scroll", onScroll));
+
+  const markEdited = () => { $("#dirty-note").hidden = false; };
+  view.addEventListener("input", (e) => {
+    if (e.target.matches('.title-input, textarea[name="notes"], textarea[name="plan"]')) markEdited();
+    if (e.target.matches(".title-input")) e.target.classList.remove("invalid");
+  });
 
   const countCases = () => {
     const n = mode === "fields"
       ? editor.cases().filter((c) => c.title.trim() || c.steps.length).length
       : [...form.elements.plan.value.matchAll(/^###\s+TC-\d+\s*:/gm)].length;
     $("#detected").textContent = `${n} test case${n === 1 ? "" : "s"}`;
+    drawOutline();
   };
   const showEditor = () => {
+    const scripts = Object.fromEntries((suite?.tests || []).map((t) => [t.id, t.script]));
     editor = caseEditor($("#cases"), plan.cases, {
-      project: slug, placeholders, onFocus: (el) => { lastField = el; }, onChange: () => editor && countCases(),
+      project: slug, placeholders, onFocus: (el) => { lastField = el; }, onChange: () => { if (editor) { countCases(); markEdited(); } },
+      badge: (id) => (suite ? `<button type="button" class="badge-btn" data-script="${esc(id)}" ${scripts[id]?.status === "none" || !scripts[id] ? "disabled" : ""}>${scriptBadge(scripts[id])}</button>` : ""),
     });
     countCases();
   };
@@ -1712,9 +2341,25 @@ async function suiteView(slug, suiteSlug, alive) {
     $("#cases").hidden = mode !== "fields";
     $("#plan-notes").hidden = mode !== "fields";
     form.elements.plan.hidden = mode !== "markdown";
+    $("#fold-all").hidden = mode !== "fields";
+    allCollapsed = false;
+    $("#fold-all").textContent = "Collapse all";
     if (mode === "fields") showEditor(); else countCases();
   };
+  $("#fold-all").addEventListener("click", (e) => {
+    allCollapsed = !allCollapsed;
+    editor.setCollapsed(allCollapsed);
+    e.target.textContent = allCollapsed ? "Expand all" : "Collapse all";
+  });
+  $("#outline").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-jump]");
+    if (b) editor.reveal(Number(b.dataset.jump));
+  });
   view.querySelectorAll("[data-edit-mode]").forEach((b) => b.addEventListener("click", () => setMode(b.dataset.editMode)));
+  $("#cases").addEventListener("click", (e) => {
+    const id = e.target.closest("[data-script]")?.dataset.script;
+    if (id) showScript(slug, suiteSlug, id);
+  });
   form.elements.plan.addEventListener("input", countCases);
   form.elements.plan.addEventListener("focus", (e) => { lastField = e.target; });
   if (placeholders.length) placeholderChips($("#suite-chips"), placeholders, () => lastField);
@@ -1747,7 +2392,18 @@ async function suiteView(slug, suiteSlug, alive) {
     e.preventDefault();
     const err = $("#form-error");
     err.hidden = true;
+    const nameInput = form.elements.name;
+    nameInput.classList.remove("invalid");
     try {
+      // A suite written by drafting a test with AI often has no name yet: name it after its first test
+      if (!nameInput.value.trim() && mode === "fields") {
+        nameInput.value = (editor.cases().find((c) => c.title.trim())?.title || "").trim().slice(0, 60);
+      }
+      if (!nameInput.value.trim()) {
+        nameInput.classList.add("invalid");
+        nameInput.focus();
+        throw new Error("Give the suite a name — it's the title field at the top of the page.");
+      }
       let planText;
       if (mode === "markdown") {
         planText = form.elements.plan.value;
@@ -1775,7 +2431,7 @@ async function suiteView(slug, suiteSlug, alive) {
     e.target.disabled = true;
     try {
       const run = await api(`/projects/${encodeURIComponent(slug)}/suites/${encodeURIComponent(suiteSlug)}/run`, {
-        method: "POST", body: { parallel: Number($("#suite-parallel").value) || 1 },
+        method: "POST", body: { parallel: Number($("#suite-parallel").value) || 1, mode: view.querySelector('select[name="suite_mode"]').value },
       });
       location.hash = `#/runs/${run.id}`;
     } catch (ex) {

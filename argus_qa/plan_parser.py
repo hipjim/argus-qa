@@ -253,6 +253,14 @@ def render_case(fields: dict, case_id: str) -> str:
     return "\n".join(out).rstrip() + "\n"
 
 
+def replace_case(plan_text: str, case: TestCase, fields: dict) -> str:
+    """The plan with one of its cases rewritten from fields. Every other case keeps its exact
+    text, and so the script recorded for it."""
+    old = case.raw_markdown
+    spacing = old[len(old.rstrip()):]  # what separated it from the "---" or the case after it
+    return plan_text.replace(old, render_case(fields, case.id).rstrip() + spacing, 1)
+
+
 def plan_fields(text: str) -> dict:
     """Split a plan into its title, URL, free-form notes (setup etc.), and test case fields."""
     plan = parse_test_plan(text)

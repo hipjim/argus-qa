@@ -49,7 +49,7 @@ build-backend = "setuptools.build_meta"
 include = ["argus_qa*"]
 
 [tool.setuptools.package-data]
-argus_qa = ["web/*", "web/vendor/*"]
+argus_qa = ["web/*", "web/vendor/*", "runner/*"]
 
 [project.scripts]
 argus-qa = "argus_qa.cli:main"
